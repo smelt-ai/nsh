@@ -1,21 +1,26 @@
 //! Guest plugin VMs on one surface: views a plugin mounts into the shell's
 //! slots (`mountSlot` / `slotTarget`) lay out, stack, take focus, compose
 //! text and show in the accessibility tree as one window, and a popover a
-//! plugin opens leaves the clip of the slot it is in.
+//! plugin opens leaves the clip of the slot it is in. Also: a native
+//! component with `pointerEvents: none` lets clicks through.
 //!
 //! Isolation (hangs, memory, prototype hardening) is covered where it is
 //! enforced: `nsh-engine`'s plugin tests and `nsh-core`'s tenant quotas.
 
 use std::{
+    rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use gpui::{Entity, Focusable, Modifiers, TestAppContext, VisualTestContext, point, px, size};
+use gpui::{
+    AnyElement, App as GpuiApp, Entity, Focusable, IntoElement, Modifiers, Styled, TestAppContext,
+    VisualTestContext, Window, div, point, px, size,
+};
 use nsh_core::access::Capabilities;
 use nsh_engine::{HostChannel, PluginConfig, Policy};
 
-use crate::{App, AppOptions, AppView, Bundle, view::NshView};
+use crate::{App, AppOptions, AppView, Bundle, NativeComponent, view::NshView};
 
 type Posts = Arc<Mutex<Vec<(String, Instant)>>>;
 
@@ -614,6 +619,93 @@ host.post("probe", "pop.ready");
 
     println!(
         "cross-plugin Popover escaped 40x40 clip (action at {ax:.0},{ay:.0}), Tab/Shift-Tab crossed Shell<->Plugin<->Popover, Chinese IME committed '你好', pressOutside closed Popover + reached Shell, unified AccessKit built {a11y_count} nodes"
+    );
+    view.update(cx, |v, _| v.stop());
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+pub(crate) fn native_component_pointer_events_none_passes_clicks_to_parent(
+    cx: &mut TestAppContext,
+) {
+    struct PassiveVisual;
+    impl NativeComponent for PassiveVisual {
+        fn render(&mut self, _: &mut Window, _: &mut GpuiApp) -> Option<AnyElement> {
+            Some(div().size_full().bg(gpui::rgb(0x336699)).into_any_element())
+        }
+        fn set_prop(
+            &mut self,
+            _: &str,
+            _: Option<&serde_json::Value>,
+            _: &mut Window,
+            _: &mut GpuiApp,
+        ) {
+        }
+    }
+
+    crate::set_ui_sets(vec![nsh_base::registry()]);
+    cx.executor().allow_parking();
+    let posts: Posts = Arc::default();
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    cx.simulate_resize(size(px(320.0), px(200.0)));
+
+    let app_tsx = r#"
+import { host, mount, nativeComponent, View } from "nsh";
+const Visual = nativeComponent<{}, {}>("test.visual", { props: [], events: [] });
+mount(() => (
+  <View style={{ width: 320, height: 200, flexDirection: "row", gap: 20, padding: 10 }}>
+    <View
+      testID="row-pass"
+      role="button"
+      onPress={() => host.post("probe", "pass.clicked")}
+      style={{ width: 100, height: 100 }}
+    >
+      <Visual style={{ width: 100, height: 100, pointerEvents: "none" }} />
+    </View>
+    <View
+      testID="row-block"
+      role="button"
+      onPress={() => host.post("probe", "block.clicked")}
+      style={{ width: 100, height: 100 }}
+    >
+      <Visual style={{ width: 100, height: 100 }} />
+    </View>
+  </View>
+));
+host.post("probe", "ready");
+"#;
+
+    let host = view.read_with(cx, |v, _| v.host());
+    attach_probe(&host, &posts);
+    let t_load = Instant::now();
+    view.update(cx, |v, _| {
+        v.register_component("test.visual", Rc::new(|_| Box::new(PassiveVisual)));
+        v.load(App::Js(bundle_tsx(app_tsx, true, &["probe"])));
+    });
+    assert!(wait_probe(cx, &posts, "ready", t_load, 5.0).is_some());
+    settle(cx, Duration::from_millis(80));
+
+    let (px_x, px_y) = view_window_center(&view, cx, "row-pass").expect("row-pass");
+    let (bx_x, bx_y) = view_window_center(&view, cx, "row-block").expect("row-block");
+
+    let t0 = Instant::now();
+    cx.simulate_click(point(px(px_x), px(px_y)), Modifiers::default());
+    assert!(
+        wait_probe(cx, &posts, "pass.clicked", t0, 3.0).is_some(),
+        "pointerEvents: none native component must pass clicks to its parent row"
+    );
+
+    let t1 = Instant::now();
+    cx.simulate_click(point(px(bx_x), px(bx_y)), Modifiers::default());
+    settle(cx, Duration::from_millis(80));
+    let blocked_fired = posts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(tag, at)| *at >= t1 && tag == "block.clicked");
+    assert!(
+        !blocked_fired,
+        "default native component must keep owning pointer hits"
     );
     view.update(cx, |v, _| v.stop());
     cx.update(|window, _| window.remove_window());
