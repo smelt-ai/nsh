@@ -130,6 +130,7 @@ and the explicit import takes its place. For the system's alert or action sheet,
 | `onDetentChange` | `.on_detent_change(..)` | `(e: { detent: SheetDetent }) => void` | | The user moved the sheet to another detent (a drag, the grabber, a scroll at its edge, a screen reader). |
 | `onOpenChange` | `.on_cancel(..)` | `(e: { open: boolean; reason: "cancel" \| "backdropPress" \| "swipe" }) => void` | | The user closed it: keep `open` in sync here. In Rust, `on_cancel` removes the dialog from the view. |
 | `class`, `style` | `Styled` methods | `string`, `StyleProp<ViewStyle>` | | The popup: the view holding the children. |
+| `startingClass`, `startingStyle` | | `string`, `StyleProp<ViewStyle>` | | TSX: the popup's look in its first frame, over its `class` and `style`; its transitions run from it as it comes in. None while the user asks for less motion. In Rust the popup is the app's own view. See [A dialog with a backdrop](#a-dialog-with-a-backdrop). |
 | `backdropClass`, `backdropStyle` | a child view filling the dialog | `string`, `StyleProp<ViewStyle>` | | A backdrop filling the dialog behind the popup, present when either is set. |
 | `children` | `.child(..)` | `JSX.Element` | | The content. |
 
@@ -310,6 +311,25 @@ when(confirm, move || {
         )
 })
 ```
+
+```tsx tabs
+<Dialog
+  open={confirm()}
+  animation="fade"
+  onOpenChange={({ open }) => confirm.set(open)}
+  backdropClass="bg-black/40"
+  class="m-auto w-80 gap-3 rounded-2xl bg-white p-5"
+>
+  <Text style={{ fontSize: 20, fontWeight: "700" }}>Delete this item?</Text>
+  <Button onPress={remove} class="items-center rounded-lg bg-red-600 px-4 py-3 active:opacity-70">
+    <Text class="font-semibold text-white">Delete</Text>
+  </Button>
+</Dialog>
+```
+
+The layer fades in and out; to have the card rise a little as it comes, give it a starting look and a transition:
+`startingClass="translate-y-1"` with `transition-transform duration-200` in its `class`.
+
 
 For the system's alert or action sheet, use [`AlertDialog`](./alert-dialog.md) from `nsh/base`.
 

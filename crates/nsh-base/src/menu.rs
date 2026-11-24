@@ -1860,9 +1860,7 @@ fn surface(
                 .offset(parts.offset)
                 .margin(parts.margin)
                 .role(AccessibilityRole::Menu)
-                .element_ref(&presence.popup())
-                .app_class(move || presence.class())
-                .state_inline_style(move || presence.style())
+                .map(|o| presence.part(o))
                 // Never past the room on its side: its items scroll. Until
                 // the core says where it went, the window bounds it.
                 .max_h(move || Length::from(room.get().unwrap_or_else(|| window().height)))
@@ -1915,11 +1913,12 @@ pub struct MenuProps {
     /// The inline style of the popup or sheet, over its classes.
     #[prop(default)]
     pub popup_style: Prop<Style>,
-    /// As a popup: classes the popup (and its submenus' popups) has in
-    /// its first frame, which its `transition` classes animate from
-    /// (Tailwind's `starting:`, CSS's `@starting-style`): its entrance. A
-    /// state's classes apply over `popupClass` and `popupStyle`, as a
-    /// state's styles do. A sheet has its own motion.
+    /// As a popup: classes the popup has in its first frame, which its
+    /// `transition` classes animate from (Tailwind's `starting:`, CSS's
+    /// `@starting-style`): its entrance. A state's classes apply over
+    /// `popupClass` and `popupStyle`, as a state's styles do. Submenus'
+    /// popups have no entrance: they show at once as the pointer moves
+    /// ([`Submenu`]). A sheet has its own motion.
     pub popup_starting_class: Prop<Option<SharedString>>,
     /// As a popup: the inline style of the popup in its first frame, over
     /// `popupStyle`.
@@ -3062,13 +3061,36 @@ pub enum SubmenuEvent {
     OpenChange(bool, OpenChangeReason),
 }
 
+/// A submenu's popup's looks: the menu's, without its entrance, and with
+/// its exit only as the level around it closes. It shows and goes at once
+/// as the pointer moves from item to item, where an entrance or exit each
+/// time flickers (as macOS's submenus do), and goes with the menu as a
+/// whole.
+fn submenu_looks(looks: StateLooks, around: Memo<bool>) -> StateLooks {
+    let (class, style) = (looks.ending_class, looks.ending_style);
+    StateLooks {
+        starting_class: Prop::default(),
+        starting_style: Prop::default(),
+        ending_class: Prop::bind(move || if around.get() { None } else { class.get() }),
+        ending_style: Prop::bind(move || {
+            if around.get() {
+                Style::default()
+            } else {
+                style.get()
+            }
+        }),
+        ..looks
+    }
+}
+
 /// A menu inside a menu: in a menu's popup its items are a popup beside
 /// its trigger, its first item level with the trigger (inside the popup's
 /// padding and border), opened as the pointer comes over the trigger or
 /// presses it; in a menu's sheet pressing the trigger shows its items in
 /// the sheet instead of the ones around it, with its `back` row first. Its
-/// popups take the menu's `popupClass` / `popupStyle` and its states' looks
-/// (`popupStartingClass`, `popupEndingClass`, ...). In a terminal its
+/// popups take the menu's `popupClass` / `popupStyle`, and its exit
+/// (`popupEndingClass`, ...) as the menu closes as a whole: they open and
+/// close at once as the pointer moves ([`submenu_looks`]). In a terminal its
 /// trigger is a row that ends with ` ›` ([`crate::terminal`]).
 /// In a popup and in a terminal, Right, Return or Space on its
 /// focused trigger open it with the keyboard focus on its first enabled
@@ -3103,7 +3125,7 @@ pub fn Submenu(props: SubmenuProps, cx: Scope<SubmenuEvent>) -> impl IntoElement
             }
     });
     let sub_open = computed(move || wanted.get() && !away.get());
-    let presence = PopupPresence::new(move || sub_open.get(), menu.looks);
+    let presence = PopupPresence::new(move || sub_open.get(), submenu_looks(menu.looks, around));
     // A sheet's: while its items are on the path.
     let open = match sheet {
         true => computed(move || around.get() && path.with(|p| p.contains(&id))),
@@ -3511,9 +3533,7 @@ pub fn Submenu(props: SubmenuProps, cx: Scope<SubmenuEvent>) -> impl IntoElement
                     .placement(Placement::Right)
                     .align(Align::Start)
                     .role(AccessibilityRole::Menu)
-                    .element_ref(&presence.popup())
-                    .app_class(move || presence.class())
-                    .state_inline_style(move || presence.style())
+                    .map(|o| presence.part(o))
                     // As the menu's: held to its room, its items scroll.
                     .max_h(move || Length::from(room.get().unwrap_or_else(|| window().height)))
                     .on_position(move |p: &OverlayPosition| room.set(Some(p.available.height)))

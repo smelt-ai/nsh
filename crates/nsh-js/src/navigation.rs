@@ -248,6 +248,13 @@ export interface DialogProps extends DialogHostProps {
   style?: StyleProp<ViewStyle>;
   /** The popup's classes. */
   class?: string;
+  /** The popup's look in its first frame (with `startingClass`): its
+   * transitions run from it as it comes in. None while the user asks for
+   * less motion. */
+  startingStyle?: StyleProp<ViewStyle>;
+  /** The popup's classes in its first frame (see `startingStyle`):
+   * `"translate-y-1"` with `class="transition-transform"` rises it 4 points. */
+  startingClass?: string;
   /** The backdrop's style: with this or `backdropClass`, a view filling the
    * dialog behind the popup (none otherwise), whose presses are close
    * attempts (`"backdropPress"`, closing when `closeOnBackdropPress`). */
@@ -1261,6 +1268,8 @@ unsafe extern "C" fn modal_run(
                     "role",
                     "class",
                     "style",
+                    "startingClass",
+                    "startingStyle",
                     "backdropClass",
                     "backdropStyle",
                     "backdropTestID",
@@ -1366,7 +1375,10 @@ fn slides_popup(cx: *mut JsContext, props: JsValue) -> bool {
 
 /// The popup: a view with the dialog's `class` and `style` holding its
 /// children (with the dialog's `insets`, borrowed); owned. `slide`: it
-/// comes up from the window's bottom edge (the layer fades).
+/// comes up from the window's bottom edge (the layer fades). With a
+/// `startingClass` or `startingStyle` (and the user not asking for less
+/// motion), that is its look until the next display frame (or a frame's
+/// time where none comes), so its transitions run from it as it comes in.
 fn popup_part(
     cx: *mut JsContext,
     props: JsValue,
@@ -1374,28 +1386,29 @@ fn popup_part(
     slide: bool,
 ) -> Result<JsValue, JsValue> {
     let popup = dom::create_element(cx, Tag::View)?;
+    let entering = starts(cx, props).then(|| reactive::new_signal(cx, qjs::JS_TRUE));
     let result = (|| -> Result<(), JsValue> {
-        let read = reader(cx, props, "class");
+        let entering = entering.unwrap_or(UNDEFINED);
+        let read = native(cx, popup_class, 0, &mut [props, entering]);
         let r = dom::bind_prop_with(cx, popup, "class", read);
         free(cx, read);
         r?;
-        if slide {
+        let offset = if slide {
             let height = crate::env::current(cx).window.height.0 as f64;
-            let offset = crate::animated::new_value(cx, height.max(1.0))?;
-            let read = native(cx, slid_style, 0, &mut [props, offset]);
-            let r = dom::bind_prop_with(cx, popup, "style", read);
-            free(cx, read);
+            crate::animated::new_value(cx, height.max(1.0))?
+        } else {
+            UNDEFINED
+        };
+        let read = native(cx, popup_style, 0, &mut [props, entering, offset]);
+        let r = dom::bind_prop_with(cx, popup, "style", read);
+        free(cx, read);
+        if slide {
             if r.is_ok() {
                 crate::animated::run_timing(cx, offset, 0.0, 320.0, [0.2, 0.8, 0.2, 1.0]);
             }
             free(cx, offset);
-            r?;
-        } else {
-            let read = reader(cx, props, "style");
-            let r = dom::bind_prop_with(cx, popup, "style", read);
-            free(cx, read);
-            r?;
         }
+        r?;
         let children = reader(cx, props, "children");
         let content = with_insets(cx, insets, children);
         free(cx, children);
@@ -1407,6 +1420,12 @@ fn popup_part(
         free(cx, content);
         r
     })();
+    if let Some(entering) = entering {
+        if result.is_ok() {
+            enter_after_first_frame(cx, entering);
+        }
+        free(cx, entering);
+    }
     match result {
         Ok(()) => Ok(popup),
         Err(e) => {
@@ -1416,9 +1435,49 @@ fn popup_part(
     }
 }
 
-/// The popup's style while it slides: the dialog's `style`, then a
-/// `translate` down by the offset, which runs to 0.
-unsafe extern "C" fn slid_style(
+/// Whether dialog `props` gives its popup a starting look the user lets it
+/// come in from (no less motion asked for).
+fn starts(cx: *mut JsContext, props: JsValue) -> bool {
+    if crate::env::current(cx).reduce_motion {
+        return false;
+    }
+    let class = get(cx, props, c"startingClass");
+    let style = get(cx, props, c"startingStyle");
+    let has_class = dom::string_arg(cx, class).is_some_and(|c| !c.trim().is_empty());
+    // SAFETY: inline checks of a live value.
+    let has_style = unsafe { !qjs::JS_IsUndefined(style) && !qjs::JS_IsNull(style) };
+    free(cx, class);
+    free(cx, style);
+    has_class || has_style
+}
+
+/// Ends the popup's starting look (signal `entering`, borrowed) at the next
+/// display frame, or after a frame's time where none comes (a surface not
+/// on screen), as a popup's does.
+fn enter_after_first_frame(cx: *mut JsContext, entering: JsValue) {
+    let enter = native(cx, end_starting, 0, &mut [entering]);
+    // SAFETY: global lookups and calls with borrowed arguments; every
+    // value made here is freed.
+    unsafe {
+        let global = qjs::JS_GetGlobalObject(cx);
+        let frame = qjs::JS_GetPropertyStr(cx, global, c"requestAnimationFrame".as_ptr());
+        let mut args = [enter];
+        let r = qjs::JS_Call(cx, frame, UNDEFINED, 1, args.as_mut_ptr());
+        qjs::JS_FreeValue(cx, r);
+        let timeout = qjs::JS_GetPropertyStr(cx, global, c"setTimeout".as_ptr());
+        let mut args = [enter, qjs::JS_NewFloat64(FIRST_FRAME_MS)];
+        let r = qjs::JS_Call(cx, timeout, UNDEFINED, 2, args.as_mut_ptr());
+        for v in [r, timeout, frame, global, enter] {
+            qjs::JS_FreeValue(cx, v);
+        }
+    }
+}
+
+/// How long a popup waits for its first display frame before it counts as
+/// past it without one, as `nsh/base`'s popups do.
+const FIRST_FRAME_MS: f64 = 50.0;
+
+unsafe extern "C" fn end_starting(
     cx: *mut JsContext,
     _this: JsValue,
     _argc: c_int,
@@ -1426,16 +1485,88 @@ unsafe extern "C" fn slid_style(
     _magic: c_int,
     data: *mut JsValue,
 ) -> JsValue {
-    // SAFETY: two data values (the props, the offset), borrowed; new
-    // values owned by the arrays and objects that take them.
+    // SAFETY: one data value (the `entering` signal), borrowed.
+    reactive::set_signal(cx, unsafe { *data }, qjs::JS_FALSE);
+    reactive::finish_value(cx, UNDEFINED)
+}
+
+/// Whether signal `entering` (borrowed; `undefined`: no starting look)
+/// still holds, read tracked.
+fn entering_now(cx: *mut JsContext, entering: JsValue) -> bool {
+    // SAFETY: an inline check, then a call of a live signal.
     unsafe {
-        let (props, offset) = (*data, *data.add(1));
-        let mut axes = [qjs::JS_NewFloat64(0.0), qjs::JS_DupValue(cx, offset)];
-        let translate = qjs::JS_NewArrayFrom(cx, 2, axes.as_mut_ptr());
-        let motion = qjs::JS_NewObject(cx);
-        qjs::JS_SetPropertyStr(cx, motion, c"translate".as_ptr(), translate);
-        let mut both = [get(cx, props, c"style"), motion];
-        qjs::JS_NewArrayFrom(cx, 2, both.as_mut_ptr())
+        if qjs::JS_IsUndefined(entering) {
+            return false;
+        }
+        let v = qjs::JS_Call(cx, entering, UNDEFINED, 0, ptr::null_mut());
+        let on = qjs::JS_IsBool(v) && qjs::JS_VALUE_GET_BOOL(v);
+        qjs::JS_FreeValue(cx, v);
+        on
+    }
+}
+
+/// The popup's classes: the dialog's `class`, then its `startingClass`
+/// while it comes in (later utilities win).
+unsafe extern "C" fn popup_class(
+    cx: *mut JsContext,
+    _this: JsValue,
+    _argc: c_int,
+    _argv: *mut JsValue,
+    _magic: c_int,
+    data: *mut JsValue,
+) -> JsValue {
+    // SAFETY: two data values (the props, the `entering` signal), borrowed.
+    let (props, entering) = unsafe { (*data, *data.add(1)) };
+    let class = get(cx, props, c"class");
+    if !entering_now(cx, entering) {
+        return class;
+    }
+    let starting = get(cx, props, c"startingClass");
+    let joined = [class, starting]
+        .iter()
+        .filter_map(|&v| dom::string_arg(cx, v))
+        .collect::<Vec<_>>()
+        .join(" ");
+    free(cx, class);
+    free(cx, starting);
+    // SAFETY: a new string.
+    unsafe { qjs::JS_NewStringLen(cx, joined.as_ptr().cast(), joined.len() as _) }
+}
+
+/// The popup's style: the dialog's `style`, then its `startingStyle` while
+/// it comes in, then, while it slides, a `translate` down by the offset
+/// (`undefined` when it does not), which runs to 0.
+unsafe extern "C" fn popup_style(
+    cx: *mut JsContext,
+    _this: JsValue,
+    _argc: c_int,
+    _argv: *mut JsValue,
+    _magic: c_int,
+    data: *mut JsValue,
+) -> JsValue {
+    // SAFETY: three data values (the props, the `entering` signal, the
+    // offset), borrowed; new values owned by the arrays and objects that
+    // take them.
+    unsafe {
+        let (props, entering, offset) = (*data, *data.add(1), *data.add(2));
+        let style = get(cx, props, c"style");
+        let starting = entering_now(cx, entering);
+        let sliding = !qjs::JS_IsUndefined(offset);
+        if !starting && !sliding {
+            return style;
+        }
+        let mut parts = vec![style];
+        if starting {
+            parts.push(get(cx, props, c"startingStyle"));
+        }
+        if sliding {
+            let mut axes = [qjs::JS_NewFloat64(0.0), qjs::JS_DupValue(cx, offset)];
+            let translate = qjs::JS_NewArrayFrom(cx, 2, axes.as_mut_ptr());
+            let motion = qjs::JS_NewObject(cx);
+            qjs::JS_SetPropertyStr(cx, motion, c"translate".as_ptr(), translate);
+            parts.push(motion);
+        }
+        qjs::JS_NewArrayFrom(cx, parts.len() as c_int, parts.as_mut_ptr())
     }
 }
 

@@ -74,6 +74,20 @@ impl App {
         *self.popup_styles(id).last().expect("styled")
     }
 
+    /// Whether a view around `id` was first sent fully transparent: the
+    /// popup it is in had a starting look.
+    fn started_transparent(&self, id: &str) -> bool {
+        let seen = self.seen.lock().unwrap();
+        let mut node = seen.test_ids[id];
+        while let Some(parent) = seen.parents.get(&node) {
+            node = *parent;
+            if seen.styles.get(&node).and_then(|s| s.first()) == Some(&0.0) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether the popup part around `id` takes no presses.
     fn popup_inert(&self, id: &str) -> bool {
         let seen = self.seen.lock().unwrap();
@@ -146,8 +160,9 @@ struct PopoverProps {
 }
 
 /// A popover whose popup fades for 200 ms between its look and its
-/// starting and ending looks, with its lifecycle and the side it went on
-/// on screen.
+/// starting and ending looks (its starting look a little less transparent
+/// above its trigger: `data-[side=top]:`), with its lifecycle and the side
+/// it went on on screen.
 #[component]
 fn PopoverScreen(props: PopoverProps) -> impl IntoElement {
     let life = signal(Vec::<&str>::new());
@@ -161,7 +176,9 @@ fn PopoverScreen(props: PopoverProps) -> impl IntoElement {
         .child(
             popover()
                 .popup_class("transition-opacity duration-200")
-                .popup_starting_class(looks.then(|| SharedString::from("opacity-0")))
+                .popup_starting_class(
+                    looks.then(|| SharedString::from("opacity-0 data-[side=top]:opacity-30")),
+                )
                 .popup_ending_class(looks.then(|| SharedString::from("opacity-0")))
                 .on_open(move || life.update(|l| l.push("open")))
                 .on_close(move || life.update(|l| l.push("close")))
@@ -207,6 +224,40 @@ fn a_popover_has_its_starting_look_in_its_first_frame() {
         1.0,
         "its look from its first frame on"
     );
+}
+
+/// It comes in once the core placed it, from its starting look on the side
+/// it went on (placed in the commit that made it, before its first frame):
+/// flipped above a trigger with no room below, its `data-[side=top]:`
+/// look; below one, not.
+#[test]
+fn a_popover_comes_in_from_the_side_it_went_on() {
+    let sided = |styles: &[f32]| styles.iter().position(|o| (o - 0.3).abs() < 1e-3);
+    let mut app = start(
+        nsh_testing::windowed_root_with::<PopoverScreen>(|| PopoverProps {
+            looks: true,
+            low: true,
+        }),
+        false,
+    );
+    app.app.press("id:trigger").unwrap();
+    app.app.wait_for("Body").unwrap();
+    app.app.run_for(Duration::from_millis(50)).unwrap();
+    let styles = app.popup_styles("body");
+    assert_eq!(
+        sided(&styles),
+        Some(0),
+        "placed before its first frame: made with its look above: {styles:?}"
+    );
+    assert_eq!(styles.last(), Some(&1.0), "then its look: {styles:?}");
+
+    let mut app = popover_app(true, false);
+    app.app.press("id:trigger").unwrap();
+    app.app.wait_for("Body").unwrap();
+    app.app.run_for(Duration::from_millis(50)).unwrap();
+    let styles = app.popup_styles("body");
+    assert_eq!(sided(&styles), None, "below its trigger: {styles:?}");
+    assert_eq!(styles.last(), Some(&1.0));
 }
 
 #[test]
@@ -369,6 +420,48 @@ fn a_desktop_menu_and_its_submenu_go_with_their_exit() {
     app.app.run_for(Duration::from_millis(150)).unwrap();
     assert!(!app.app.shows("New") && !app.app.shows("Mail"));
     app.app.wait_for("Closed: true").unwrap();
+}
+
+/// A desktop menu fading in and out over 200 ms, with two submenus.
+#[component]
+fn SubmenusScreen() -> impl IntoElement {
+    let sub = |trigger: &'static str, item: &'static str| {
+        submenu()
+            .trigger(view().test_id(trigger).h(px(30.0)).child(text(trigger)))
+            .child(menu_item().child(view().test_id(item).h(px(30.0)).child(text(item))))
+    };
+    view().pt(px(100.0)).pl(px(40.0)).child(
+        menu()
+            .popup_class("transition-opacity duration-200")
+            .popup_starting_class("opacity-0")
+            .popup_ending_class("opacity-0")
+            .trigger(
+                view()
+                    .test_id("file")
+                    .w(px(80.0))
+                    .h(px(30.0))
+                    .child(text("File")),
+            )
+            .child(sub("Share", "Mail"))
+            .child(sub("Export", "PDF")),
+    )
+}
+
+#[test]
+fn a_submenu_shows_and_goes_at_once_as_the_pointer_moves() {
+    // The menu comes with its entrance; its submenus follow the pointer
+    // from item to item, where an entrance or exit each time flickers.
+    let mut app = start(nsh_testing::windowed_root::<SubmenusScreen>(), false);
+    app.app.press("id:file").unwrap();
+    app.app.run_for(Duration::from_millis(250)).unwrap();
+    assert!(app.started_transparent("Share"), "the menu's entrance");
+    app.app.press("id:Share").unwrap();
+    app.app.wait_for("Mail").unwrap();
+    assert!(!app.started_transparent("Mail"), "no entrance");
+    app.app.press("id:Export").unwrap();
+    app.app.wait_for("PDF").unwrap();
+    assert!(!app.app.shows("Mail"), "the other one gone at once");
+    assert!(!app.started_transparent("PDF"), "no entrance");
 }
 
 /// A desktop menu fading for 120 ms on its way out, with the items chosen

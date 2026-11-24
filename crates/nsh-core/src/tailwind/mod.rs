@@ -1156,14 +1156,29 @@ fn themed(
     ))
 }
 
-/// Whether `name` names a boolean `data-*` attribute (`data-<name>:`):
-/// lower case letters, digits and `-`. Tailwind's `data-[state=open]:`,
-/// an attribute's value, is not supported.
+/// Whether `name` is a `data-*` attribute's name or value: lower case
+/// letters, digits and `-`.
 fn data_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The `data-*` attribute variant `v` (after `data-`) tests: a boolean one
+/// (`data-range-start:`, `[data-range-start]`) by its name, one with a
+/// value (`data-[side=top]:`, `[data-side="top"]`, quoted or not) as
+/// `side=top`, the name a part shows it under (`project_data`).
+fn data_attr(v: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if data_name(v) {
+        return Some(v.into());
+    }
+    let (name, value) = v.strip_prefix('[')?.strip_suffix(']')?.split_once('=')?;
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    (data_name(name) && data_name(value)).then(|| format!("{name}={value}").into())
 }
 
 /// Applies variant `v` to `cond`; returns its place in Tailwind's order.
@@ -1321,11 +1336,11 @@ fn variant(theme: &Theme, v: &str, cond: &mut Condition) -> Option<Key> {
         }
         v => {
             // `data-range-start`: Tailwind 4's boolean form, `[data-range-start]`.
-            if let Some(name) = v.strip_prefix("data-").filter(|n| data_name(n)) {
+            if let Some(name) = v.strip_prefix("data-").and_then(data_attr) {
                 if !cond.data.iter().any(|d| **d == *name) {
-                    cond.data.push(name.into());
+                    cond.data.push(name.as_ref().into());
                 }
-                return Some(Key::data(name));
+                return Some(Key::data(&name));
             }
             if let Some(rest) = v.strip_prefix("group-") {
                 // `group-hover`, `group-hover/item`.
@@ -1333,16 +1348,16 @@ fn variant(theme: &Theme, v: &str, cond: &mut Condition) -> Option<Key> {
                     Some((s, n)) => (s, n),
                     None => (rest, ""),
                 };
-                if let Some(data) = s.strip_prefix("data-").filter(|n| data_name(n)) {
+                if let Some(data) = s.strip_prefix("data-").and_then(data_attr) {
                     let entry = cond.group.get_or_insert_with(|| (name.into(), 0));
                     if *entry.0 != *name {
                         return None;
                     }
                     if !cond.group_data.iter().any(|d| **d == *data) {
-                        cond.group_data.push(data.into());
+                        cond.group_data.push(data.as_ref().into());
                     }
                     let mut group = Rank::default();
-                    group.add_group(&Key::data(data), name);
+                    group.add_group(&Key::data(&data), name);
                     return group.0.pop();
                 }
                 let (bit, inner) = match s {

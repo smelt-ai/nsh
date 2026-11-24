@@ -131,7 +131,7 @@ popover()
 </Popover>
 ```
 
-`onPosition({ placement, bounds, available })` 说明弹出层放在了哪里：它位于触发元素的哪一侧（`placement` 那一侧空间不够时是另一侧）、它的框以及那一侧的空间，方便箭头或出现动画指向触发元素。
+`onPosition({ placement, bounds, available })` 说明弹出层放在了哪里：它位于触发元素的哪一侧（`placement` 那一侧空间不够时是另一侧）、它的框以及那一侧的空间。弹出层还会把这一侧标成 `data-side`，在第一帧之前就标好，和 Radix、Base UI 一样：`popupStartingClass` 里写 `data-[side=bottom]:-translate-y-1 data-[side=top]:translate-y-1`，翻到另一侧时也会从触发元素那边进来。`Menu`、`ContextMenu`、`Select`、`Combobox`、`HoverCard` 和 `Tooltip` 的弹出层也一样。
 
 <a id="props"></a>
 

@@ -2615,7 +2615,9 @@ pub trait Interactive: Element {
     /// while `on` holds, as Tailwind's `data-<name>:` variant reads it: its
     /// `data-<name>:` classes apply, and with `group` the
     /// `group-data-<name>:` classes inside it (a calendar's day at the
-    /// start of a range: `project_data("range-start", ..)`). For what a
+    /// start of a range: `project_data("range-start", ..)`). An attribute
+    /// with a value is named with it, `"side=top"`, as
+    /// `data-[side=top]:` reads it (a popup above its trigger). For what a
     /// component's part shows beyond the states screen readers hear; the
     /// attribute tells them nothing. A view whose classes read none of its
     /// attributes sends nothing when they change.

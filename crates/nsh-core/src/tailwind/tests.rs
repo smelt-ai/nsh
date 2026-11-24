@@ -1467,13 +1467,34 @@ fn data_variants() {
     assert!(list.deps() & deps::DATA != 0 && list.deps() & deps::GROUP != 0);
     // Not a state: nothing for the platform to report.
     assert_eq!(list.tracked_states(), 0);
-    // Only the boolean form: a value (`data-[state=open]:`), an empty or an
-    // upper case name are unknown.
+    // An empty or an upper case name, and a bracket without a value, are
+    // unknown.
     let unknown = parse(
         &theme,
-        "data-[state=open]:bg-black data-:bg-black data-Open:bg-black group-data-[x]:p-1",
+        "data-:bg-black data-Open:bg-black group-data-[x]:p-1 data-[Side=top]:p-1 data-[side=]:p-1",
     );
-    assert_eq!(unknown.unknown().len(), 4, "{:?}", unknown.unknown());
+    assert_eq!(unknown.unknown().len(), 5, "{:?}", unknown.unknown());
+    // With a value (`data-[side=top]:`, quoted or not): the part shows it
+    // as `side=top`.
+    let sided = "bg-white data-[side=top]:bg-black";
+    let s = styled_data(sided, &["side=top"], &[], 0);
+    assert_eq!(s.view.background_color, Color(0x0000_00ff));
+    let s = styled_data(sided, &["side=bottom"], &[], 0);
+    assert_eq!(s.view.background_color, Color(0xffff_ffff));
+    let s = styled_data(
+        r#"bg-white data-[side="top"]:bg-black"#,
+        &["side=top"],
+        &[],
+        0,
+    );
+    assert_eq!(s.view.background_color, Color(0x0000_00ff));
+    let s = styled_data(
+        "opacity-100 group-data-[side=left]:opacity-50",
+        &[],
+        &["side=left"],
+        0,
+    );
+    assert_eq!(s.view.opacity, 0.5);
     // A view's own.
     let s = styled_data(
         "bg-white data-range-start:bg-black",

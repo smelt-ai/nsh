@@ -6,7 +6,8 @@
 //! Escape and the back button; deciding to close is theirs. A sheet comes
 //! and goes with its own motion ([`SheetMotion`]); a popup's entrance and
 //! exit are the app's transitions between its look and its states' looks
-//! ([`PopupPresence`]).
+//! ([`PopupPresence`]), which can read the side the core placed it on
+//! (`data-[side=top]:`).
 //!
 //! How a popup presents itself follows the device (`auto`, the only
 //! presentation for now): on the desktops (and desktop browsers) a menu is
@@ -189,6 +190,8 @@ fn flips(
 /// How long a popup waits for its first display frame before it counts as
 /// past it without one (a surface not on screen), as a toast does.
 const FIRST_FRAME_MS: u64 = 50;
+/// The longest a popup's entrance waits for the core to place it.
+const PLACE_CAP: Duration = Duration::from_millis(250);
 /// The longest a popup stays mounted through its exit, whatever its
 /// transitions say.
 const EXIT_CAP: Duration = Duration::from_secs(2);
@@ -290,6 +293,9 @@ pub(crate) struct PopupPresence {
     looks: StateLooks,
     /// The popup part, whose transitions its exit waits for.
     popup: ElementRef,
+    /// The side of its anchor the core placed it on (`onPosition`), since
+    /// it was last mounted.
+    side: Signal<Option<Placement>>,
     /// A stale frame, timer or exit cannot finish a newer change.
     generation: Stored<u64>,
 }
@@ -303,6 +309,7 @@ impl PopupPresence {
             status: signal(Status::Open),
             looks,
             popup: element_ref(),
+            side: signal(None),
             generation: stored(0),
         };
         // Runs again only when it opens or closes (not when what `open`
@@ -328,8 +335,9 @@ impl PopupPresence {
                 }
                 return;
             }
-            let generation = self.next_change();
+            self.next_change();
             let starting = !reduce_motion() && self.looks.has_starting();
+            self.side.set(None);
             self.status.set(if starting {
                 Status::Starting
             } else {
@@ -337,17 +345,9 @@ impl PopupPresence {
             });
             self.mounted.set(true);
             if starting {
-                // Open from the next display frame, or a frame's time
-                // where none comes, whichever is first.
-                let enter = move || {
-                    if self.generation.get() == generation
-                        && self.status.get_untracked() == Status::Starting
-                    {
-                        self.status.set(Status::Open);
-                    }
-                };
-                request_animation_frame(move |_| enter());
-                set_timeout(Duration::from_millis(FIRST_FRAME_MS), enter);
+                // Placed or not, it comes in at last.
+                let generation = self.generation.get();
+                set_timeout(PLACE_CAP, move || self.enter(generation));
             }
         } else if self.mounted.get_untracked() && status != Status::Ending {
             let generation = self.next_change();
@@ -381,6 +381,47 @@ impl PopupPresence {
             // And at the latest after the cap, whatever the answer.
             set_timeout(EXIT_CAP, finish);
         }
+    }
+
+    /// The core placed it on `side` of its anchor (`onPosition`). Its
+    /// first place ends its starting look: it comes in from the next
+    /// display frame (or a frame's time where none comes), its look at the
+    /// side it went on already applied, so an entrance from that side
+    /// (`data-[side=bottom]:-translate-y-1`) runs from the right one even
+    /// where the core flipped it.
+    fn placed(self, side: Placement) {
+        let first = self.side.get_untracked().is_none();
+        self.side.set(Some(side));
+        if first && self.status.get_untracked() == Status::Starting {
+            let generation = self.generation.get();
+            request_animation_frame(move |_| self.enter(generation));
+            set_timeout(Duration::from_millis(FIRST_FRAME_MS), move || {
+                self.enter(generation)
+            });
+        }
+    }
+
+    /// Starting (and still the opening `generation`): open.
+    fn enter(self, generation: u64) {
+        if self.generation.get() == generation && self.status.get_untracked() == Status::Starting {
+            self.status.set(Status::Open);
+        }
+    }
+
+    /// Its popup part: `overlay` with its ref, its looks, and the side of
+    /// its anchor the core placed it on as attribute `data-side`
+    /// (`data-[side=top]:`, ..., Base UI's and Radix's `data-side`).
+    pub(crate) fn part(self, overlay: Overlay) -> Overlay {
+        let on = move |side: Placement| move || self.side.get() == Some(side);
+        overlay
+            .element_ref(&self.popup)
+            .app_class(move || self.class())
+            .state_inline_style(move || self.style())
+            .project_data("side=top", on(Placement::Top))
+            .project_data("side=bottom", on(Placement::Bottom))
+            .project_data("side=left", on(Placement::Left))
+            .project_data("side=right", on(Placement::Right))
+            .on_position(move |p: &OverlayPosition| self.placed(p.placement))
     }
 
     /// A new change: what an older one left pending no longer acts.
@@ -966,9 +1007,7 @@ pub(crate) fn dropdown(
             // virtualize against (unbounded, a list of thousands would
             // make every row).
             .max_h(move || Length::from(room.get().unwrap_or_else(|| window().height)))
-            .element_ref(&popup.popup())
-            .app_class(move || popup.class())
-            .state_inline_style(move || popup.style())
+            .map(|o| popup.part(o))
             .on_position(move |p: &OverlayPosition| room.set(Some(p.available.height)))
             .on_press_outside(move |_: &Point<Points>| dismiss(OpenChangeReason::PressOutside))
             .on_cancel(cancel)

@@ -496,7 +496,7 @@ view()
 | `aria-busy:` | 元素处于忙碌状态：`accessibilityState.busy` 为 `true` |  |
 | `aria-checked:` | 元素已勾选：`accessibilityState.checked` 为 `true`，同 `checked:` |  |
 | `aria-selected:` | 元素已选中：`accessibilityState.selected` 为 `true`，同 `selected:` |  |
-| `data-<name>:` | 元素带有名为 `name` 的布尔 `data-*` 属性（Tailwind 的 `&[data-<name>]`；名称由小写字母、数字和 `-` 组成）：组件的部件在状态之外显示的信息，比如日历中区间起点的那一天带 `data-range-start` | 用 `Interactive::project_data(name, …)` 设置 |
+| `data-<name>:`、`data-[<name>=<value>]:` | 元素带有名为 `name` 的 `data-*` 属性，或者它的值是 `value`（Tailwind 的 `&[data-<name>]`、`&[data-<name>="<value>"]`；名称和值由小写字母、数字和 `-` 组成，值可以加引号）：组件的部件在状态之外显示的信息，比如日历中区间起点的那一天带 `data-range-start`，弹出层在触发元素上方时带 `data-side="top"` | 用 `Interactive::project_data(name, …)` 设置（带值的写成 `"side=top"`） |
 
 这些状态写成样式对象，就是每个元素都有的 `activeStyle`、`hoverStyle`、`focusStyle`、`focusVisibleStyle`、`focusWithinStyle`、`disabledStyle`、`checkedStyle`、`indeterminateStyle`、`expandedStyle` 和 `pressedStyle` 属性（以及 `Button` 的 `selectedStyle`）；它们叠加在元素的样式和类之上。
 

@@ -1415,6 +1415,52 @@ fn backdrop_of(batch: &MountBatch, modal: u32) -> Option<u32> {
     })
 }
 
+const DIALOG_STARTING: &str = r##"import { mount, Text, View } from "nsh";
+import { Dialog } from "nsh/base";
+
+mount(() => (
+  <View style={{ flex: 1 }}>
+    <Dialog
+      animation="fade"
+      class="bg-white"
+      startingClass="opacity-50"
+      startingStyle={{ backgroundColor: "#000000" }}
+    >
+      <Text>in dialog</Text>
+    </Dialog>
+  </View>
+));
+"##;
+
+/// A dialog's popup has its starting look (`startingClass`,
+/// `startingStyle`) in its first frame and its own after it, so its
+/// transitions run from that look as it comes in.
+#[test]
+fn a_dialogs_popup_comes_in_from_its_starting_look() {
+    let (_engine, rx) = start_app(DIALOG_STARTING);
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first frame");
+    let modal = modal_of(&first).expect("a dialog");
+    let popup = children_of(&first, modal)[0];
+    let style_of = |batch: &MountBatch| {
+        batch.items.iter().rev().find_map(|i| match i {
+            MountItem::ViewStyle { id, style } if *id == popup => Some(style.clone()),
+            _ => None,
+        })
+    };
+    let (black, white) = (
+        nsh_core::Color::parse("#000000").unwrap(),
+        nsh_core::Color::parse("#ffffff").unwrap(),
+    );
+    let starting = style_of(&first).expect("the popup is styled");
+    assert_eq!(starting.opacity, 0.5);
+    assert_eq!(starting.background_color, black);
+    next(&rx, |b| {
+        style_of(b).is_some_and(|s| s.opacity == 1.0 && s.background_color == white)
+    });
+}
+
 const DIALOG_PARTS: &str = r##"import { mount, signal, Text, View } from "nsh";
 import { Dialog } from "nsh/base";
 

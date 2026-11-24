@@ -255,9 +255,7 @@ pub fn HoverCard(props: HoverCardProps, cx: Scope<HoverCardEvent>) -> impl IntoE
                     .align(props.align)
                     .offset(props.offset)
                     .margin(props.margin)
-                    .element_ref(&presence.popup())
-                    .app_class(move || presence.class())
-                    .state_inline_style(move || presence.style())
+                    .map(|o| presence.part(o))
                     .when(desktop, |card| {
                         card.on_mouse_enter(move |_: &MouseEvent| {
                             over.with(|o| o.card = true);

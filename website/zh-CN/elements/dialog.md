@@ -119,6 +119,7 @@ fn example() -> impl IntoElement {
 | `onDetentChange` | `.on_detent_change(..)` | `(e: { detent: SheetDetent }) => void` | | 用户把 sheet 移到了另一档（拖动、抓手、在边缘滚动、读屏）。 |
 | `onOpenChange` | `.on_cancel(..)` | `(e: { open: boolean; reason: "cancel" \| "backdropPress" \| "swipe" }) => void` | | 用户关闭了它：在这里同步 `open`。在 Rust 中，由 `on_cancel` 把对话框移出视图。 |
 | `class`、`style` | `Styled` 方法 | `string`、`StyleProp<ViewStyle>` | | 弹出层：包含子元素的视图。 |
+| `startingClass`、`startingStyle` | | `string`、`StyleProp<ViewStyle>` | | TSX：弹出层第一帧的样子，叠在它的 `class`、`style` 之上；进场时过渡从这个样子开始。用户要求减少动态效果时不生效。Rust 里弹出层是应用自己的视图。 |
 | `backdropClass`、`backdropStyle` | 铺满对话框的子视图 | `string`、`StyleProp<ViewStyle>` | | 铺满 dialog、位于弹出层后面的背景层，设置其中之一时出现。 |
 | `children` | `.child(..)` | `JSX.Element` | | 内容。 |
 
@@ -286,6 +287,24 @@ when(confirm, move || {
         )
 })
 ```
+
+```tsx tabs
+<Dialog
+  open={confirm()}
+  animation="fade"
+  onOpenChange={({ open }) => confirm.set(open)}
+  backdropClass="bg-black/40"
+  class="m-auto w-80 gap-3 rounded-2xl bg-white p-5"
+>
+  <Text style={{ fontSize: 20, fontWeight: "700" }}>删除这一项？</Text>
+  <Button onPress={remove} class="items-center rounded-lg bg-red-600 px-4 py-3 active:opacity-70">
+    <Text class="font-semibold text-white">删除</Text>
+  </Button>
+</Dialog>
+```
+
+图层整层淡入淡出；想让卡片进场时稍微升起，给它一个入场样子和过渡：`startingClass="translate-y-1"`，`class` 里加 `transition-transform duration-200`。
+
 
 如果需要系统提示框或操作表，请使用 `nsh/base` 的 [`AlertDialog`](./alert-dialog.md)。
 

@@ -143,7 +143,10 @@ with inline styles. When the user asks for less motion, it appears and goes at o
 ```
 
 `onPosition({ placement, bounds, available })` says where the popup went: the side of the trigger (the other one when
-`placement` had no room), its frame and the room on that side, so an arrow or an entrance can point at the trigger.
+`placement` had no room), its frame and the room on that side. The popup also shows that side as `data-side`, set before
+its first frame, as Radix and Base UI have it: `data-[side=bottom]:-translate-y-1 data-[side=top]:translate-y-1` in
+`popupStartingClass` makes it come in from the trigger even where it went to the other side. So do the popups of
+`Menu`, `ContextMenu`, `Select`, `Combobox`, `HoverCard` and `Tooltip`.
 
 ## Props
 

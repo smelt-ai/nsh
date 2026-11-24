@@ -209,9 +209,7 @@ pub fn Popover(props: PopoverProps, cx: Scope<PopoverEvent>) -> impl IntoElement
                     .align(props.align)
                     .offset(props.offset)
                     .margin(props.margin)
-                    .element_ref(&presence.popup())
-                    .app_class(move || presence.class())
-                    .state_inline_style(move || presence.style())
+                    .map(|o| presence.part(o))
                     .on_position(move |p: &OverlayPosition| {
                         cx.emit(PopoverEvent::Position(p.placement, p.bounds, p.available))
                     })
