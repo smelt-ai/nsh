@@ -206,7 +206,7 @@ pub use self::{
         Answer, ClipboardImage, ClipboardItem, ClipboardWrite, DialogAnswer, DialogCloser,
         DialogReply, ImageSize, Task,
     },
-    tokens::{FONT_MONO, FONT_SANS, ThemeTokens, Token, TokenSource, Tokens},
+    tokens::{AdaptiveShadow, FONT_MONO, FONT_SANS, ThemeTokens, Token, TokenSource, Tokens},
     value::{JsValue, NodeRef, PropEnum, PropError, SharedString, TsType, TsTypes, ts_of},
     virtual_list::{ListLayout, ViewableItems, VirtualList, virtual_list},
     watch::OrderWatch,

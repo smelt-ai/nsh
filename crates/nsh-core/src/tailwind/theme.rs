@@ -84,6 +84,7 @@ pub(crate) struct ClassTokens {
     colors: FxHashMap<Box<str>, AdaptiveColor>,
     numbers: FxHashMap<Box<str>, f32>,
     fonts: FxHashMap<Box<str>, Arc<str>>,
+    shadows: FxHashMap<Box<str>, crate::element::AdaptiveShadow>,
 }
 
 static DEFAULT_TOKENS: LazyLock<Arc<ClassTokens>> =
@@ -96,15 +97,20 @@ impl ClassTokens {
             colors: theme.colors().map(|(k, c)| (k.into(), c)).collect(),
             numbers: theme.numbers().map(|(k, n)| (k.into(), n)).collect(),
             fonts: theme.fonts().map(|(k, f)| (k.into(), f.clone())).collect(),
+            shadows: theme
+                .shadows()
+                .map(|(k, s)| (k.into(), s.clone()))
+                .collect(),
         }
     }
 
-    /// The names of the colors, the numbers and the fonts.
+    /// The names of the colors, the numbers, the fonts and the shadows.
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.colors
             .keys()
             .chain(self.numbers.keys())
             .chain(self.fonts.keys())
+            .chain(self.shadows.keys())
             .map(|n| &**n)
     }
 
@@ -114,20 +120,32 @@ impl ClassTokens {
         self.colors.len() == other.colors.len()
             && self.numbers.len() == other.numbers.len()
             && self.fonts.len() == other.fonts.len()
+            && self.shadows.len() == other.shadows.len()
             && self.colors.keys().all(|k| other.colors.contains_key(k))
             && self.numbers.keys().all(|k| other.numbers.contains_key(k))
             && self.fonts.keys().all(|k| other.fonts.contains_key(k))
+            && self.shadows.keys().all(|k| other.shadows.contains_key(k))
     }
 
     /// Whether `utility` is one of Tailwind's that a token replaces:
-    /// `font-sans` and `font-mono` when the theme has those fonts.
+    /// `font-sans` and `font-mono` when the theme has those fonts,
+    /// `shadow-md` (and `shadow-md/50`) when it has that shadow.
     pub(crate) fn replaces(&self, utility: &str) -> bool {
-        self.fonts.contains_key(utility)
+        self.fonts.contains_key(utility) || self.shadow(utility).is_some()
+    }
+
+    /// The shadow `utility` names (`shadow-card/50`), with what follows
+    /// its name (`/50`).
+    fn shadow<'u>(&self, utility: &'u str) -> Option<(&crate::element::AdaptiveShadow, &'u str)> {
+        let end = utility.find('/').unwrap_or(utility.len());
+        let (name, rest) = utility.split_at(end);
+        Some((self.shadows.get(name)?, rest))
     }
 
     /// `utility` with its tokens replaced by their values in the light or
     /// dark appearance, as arbitrary values: `bg-primary/50` is
-    /// `bg-[color:#171717ff]/50`, `rounded-(--radius)` is `rounded-[12px]`.
+    /// `bg-[color:#171717ff]/50`, `rounded-(--radius)` is `rounded-[12px]`,
+    /// `shadow-card` is `shadow-[0_1px_2px_#0000001a]`.
     /// `None` when it names none, or one there is not.
     pub(crate) fn substitute(&self, utility: &str, dark: bool) -> Option<String> {
         let hex = |out: &mut String, c: &AdaptiveColor| {
@@ -136,6 +154,14 @@ impl ClassTokens {
         };
         if let Some(family) = self.fonts.get(utility) {
             return Some(format!("font-[family-name:{}]", family.replace(' ', "_")));
+        }
+        // `shadow-card/50` is `shadow-[0_1px_2px_#0000001a]/50`.
+        if let Some((shadow, rest)) = self.shadow(utility) {
+            let css = if dark { &shadow.dark } else { &shadow.light };
+            return Some(format!(
+                "shadow-[{}]{rest}",
+                css.replace('_', "\\_").replace(' ', "_")
+            ));
         }
         if utility.contains('(') {
             // `(--name)` and `(hint:--name)`, Tailwind 4's shorthand of

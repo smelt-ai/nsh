@@ -1,5 +1,6 @@
-//! Design tokens: colors with a light and a dark value, numbers and font
-//! families, by name (`muted-foreground`, `radius`, `font-sans`). The core
+//! Design tokens: colors with a light and a dark value, numbers, font
+//! families and shadows, by name (`muted-foreground`, `radius`,
+//! `font-sans`, `shadow-card`). The core
 //! gives no name a meaning but `font-sans`, the app's default font (as
 //! Tailwind's `--font-sans` is a page's), and has none of its own: a UI set
 //! brings them (`nsh-base`'s theme, through
@@ -8,7 +9,7 @@
 //!
 //! A name is a CSS custom property's without its `--`: Tailwind classes name
 //! every token as they name a theme variable (`bg-muted`, `bg-up/30`,
-//! `rounded-(--radius)`, `font-(family-name:--font-mono)`;
+//! `rounded-(--radius)`, `font-(family-name:--font-mono)`, `shadow-card`;
 //! `tailwind/theme.rs`), TS reads them with `nsh`'s `token()`, and Rust
 //! components with [`super::tokens`].
 
@@ -24,13 +25,25 @@ pub const FONT_SANS: &str = "font-sans";
 /// The monospaced font family's token: Tailwind's `--font-mono`.
 pub const FONT_MONO: &str = "font-mono";
 
-/// Design tokens by name: colors with a value per appearance, numbers and
-/// font families. The default has none.
+/// Design tokens by name: colors with a value per appearance, numbers,
+/// font families and shadows with a value per appearance. The default has
+/// none.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Tokens {
     colors: FxHashMap<Box<str>, AdaptiveColor>,
     numbers: FxHashMap<Box<str>, f32>,
     fonts: FxHashMap<Box<str>, Arc<str>>,
+    shadows: FxHashMap<Box<str>, AdaptiveShadow>,
+}
+
+/// A shadow token's value: CSS `box-shadow` layers per appearance
+/// (`0 4px 12px #0000001f, 0 0 0 1px #0000000f`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveShadow {
+    /// In the light appearance.
+    pub light: Arc<str>,
+    /// In the dark appearance.
+    pub dark: Arc<str>,
 }
 
 /// A token's value.
@@ -129,6 +142,30 @@ impl Tokens {
         self.fonts.insert(name.into(), family.into());
     }
 
+    /// The shadow named `name`.
+    pub fn shadow(&self, name: &str) -> Option<&AdaptiveShadow> {
+        self.shadows.get(name)
+    }
+
+    /// Sets the shadow named `name`, Tailwind 4's `--shadow-*`: its class
+    /// is the name (`shadow-card`, `hover:shadow-card/50`), and one named as
+    /// a size of Tailwind's (`shadow-md`) replaces it. `false`, changing
+    /// nothing, when `light` or `dark` is no CSS `box-shadow`.
+    pub fn set_shadow(&mut self, name: &str, light: &str, dark: &str) -> bool {
+        let valid = |s: &str| crate::css::box_shadows(s).is_some_and(|l| !l.is_empty());
+        if !name.starts_with("shadow-") || !valid(light) || !valid(dark) {
+            return false;
+        }
+        self.shadows.insert(
+            name.into(),
+            AdaptiveShadow {
+                light: light.trim().into(),
+                dark: dark.trim().into(),
+            },
+        );
+        true
+    }
+
     /// The token named `name`, of any kind (a color first, as classes take
     /// it).
     pub fn get(&self, name: &str) -> Option<Token> {
@@ -143,7 +180,10 @@ impl Tokens {
 
     /// Whether it has no token.
     pub fn is_empty(&self) -> bool {
-        self.colors.is_empty() && self.numbers.is_empty() && self.fonts.is_empty()
+        self.colors.is_empty()
+            && self.numbers.is_empty()
+            && self.fonts.is_empty()
+            && self.shadows.is_empty()
     }
 
     /// Each color by name.
@@ -161,6 +201,11 @@ impl Tokens {
         self.fonts.iter().map(|(k, f)| (&**k, f))
     }
 
+    /// Each shadow by name.
+    pub fn shadows(&self) -> impl Iterator<Item = (&str, &AdaptiveShadow)> {
+        self.shadows.iter().map(|(k, s)| (&**k, s))
+    }
+
     /// `self` with the tokens of `base` it does not have.
     pub fn over(&self, base: &Tokens) -> Tokens {
         let mut out = base.clone();
@@ -170,6 +215,8 @@ impl Tokens {
             .extend(self.numbers.iter().map(|(k, n)| (k.clone(), *n)));
         out.fonts
             .extend(self.fonts.iter().map(|(k, f)| (k.clone(), f.clone())));
+        out.shadows
+            .extend(self.shadows.iter().map(|(k, s)| (k.clone(), s.clone())));
         out
     }
 }
@@ -225,5 +272,23 @@ mod tests {
         assert_eq!(tokens.font(FONT_SANS).map(|f| &**f), Some("Inter"));
         assert_eq!(tokens.font(FONT_MONO).map(|f| &**f), Some("Iosevka"));
         assert!(Tokens::default().is_empty());
+    }
+
+    #[test]
+    fn shadows_are_box_shadows_named_shadow_and_win_over_others() {
+        let mut base = Tokens::default();
+        assert!(base.set_shadow("shadow-card", "0 1px 2px #0000001a", "0 1px 2px #00000066"));
+        assert!(!base.set_shadow("shadow-color", "#000000", "#000000"));
+        assert!(!base.set_shadow("shadow-blur", "3px", "3px"));
+        assert!(!base.set_shadow("card", "0 1px 2px #000", "0 1px 2px #000"));
+        assert!(base.shadow("shadow-color").is_none());
+        let mut top = Tokens::default();
+        assert!(top.set_shadow("shadow-card", " 0 2px 4px #000 ", "0 2px 4px #fff"));
+        let tokens = top.over(&base);
+        assert_eq!(
+            &*tokens.shadow("shadow-card").unwrap().light,
+            "0 2px 4px #000"
+        );
+        assert!(!top.is_empty());
     }
 }

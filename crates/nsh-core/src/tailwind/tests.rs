@@ -1867,6 +1867,74 @@ fn font_tokens_are_tailwinds_sans_and_mono() {
     assert_ne!(parse(&theme, "font-sans").deps() & deps::THEME, 0);
 }
 
+#[test]
+fn shadow_tokens_are_classes_per_appearance_and_replace_tailwinds() {
+    let mut theme = Theme::default();
+    let mut ui = crate::element::Tokens::default();
+    assert!(ui.set_shadow(
+        "shadow-floating",
+        "0 4px 12px #0000001f, 0 0 0 1px #0000000f",
+        "0 4px 12px #00000066, 0 0 0 1px #ffffff1a",
+    ));
+    assert!(ui.set_shadow("shadow-md", "0 3px 6px #00000014", "0 3px 6px #00000052"));
+    theme.set_tokens(&ui);
+
+    let layers = |classes: &str, dark: bool| {
+        let (style, _) = styled_with_theme(&theme, classes, dark);
+        style
+            .view
+            .effects
+            .map(|e| e.box_shadows.clone())
+            .unwrap_or_default()
+    };
+    let light = layers("shadow-floating", false);
+    assert_eq!(light.len(), 2);
+    assert_eq!(light[0].offset_y, px(4.0));
+    assert_eq!(light[0].blur, px(12.0));
+    assert_eq!(light[0].color, Color(0x0000_001f));
+    assert_eq!(light[1].spread, px(1.0));
+    let dark = layers("shadow-floating", true);
+    assert_eq!(dark[0].color, Color(0x0000_0066));
+    assert_eq!(dark[1].color, Color(0xffff_ff1a));
+    // A shadow named as one of Tailwind's sizes replaces it.
+    let md = layers("shadow-md", false);
+    assert_eq!(md.len(), 1);
+    assert_eq!(md[0].blur, px(6.0));
+    // The modifier is the layers' alpha, as a size's.
+    assert_eq!(
+        layers("shadow-floating/50", false)[0].color,
+        Color(0x0000_0080)
+    );
+    assert_ne!(parse(&theme, "shadow-floating").deps() & deps::THEME, 0);
+    assert!(
+        !parse(&Theme::default(), "shadow-floating")
+            .unknown()
+            .is_empty()
+    );
+}
+
+/// `classes` applied with `theme` in the light or dark appearance.
+fn styled_with_theme(theme: &Theme, classes: &str, dark: bool) -> (Style, ClassProps) {
+    let group = |_: &str| 0;
+    let list = parse(theme, classes);
+    assert!(list.unknown().is_empty(), "{:?}", list.unknown());
+    let mut style = Style::default();
+    let mut props = ClassProps::default();
+    let context = Context {
+        env: ClassEnvironment {
+            dark,
+            ..Default::default()
+        },
+        window: crate::geometry::size_pt(390.0, 844.0),
+        rtl: false,
+        states: 0,
+        position: 0,
+        group: &group,
+    };
+    list.apply(&context, theme, &mut style, &mut props, |_| {});
+    (style, props)
+}
+
 /// `classes` applied with `theme`, in light appearance.
 fn styled_in(theme: &Theme, classes: &str) -> Style {
     let group = |_: &str| 0;

@@ -287,6 +287,15 @@ impl Theme {
         self.edit(|t| t.set_font(name, family));
     }
 
+    /// Sets the shadow named `name` ([`Tokens::set_shadow`]: `shadow-card`,
+    /// CSS `box-shadow` layers per appearance). `false`, changing nothing,
+    /// when it is none.
+    pub fn set_shadow(&mut self, name: &str, light: &str, dark: &str) -> bool {
+        let mut set = false;
+        self.edit(|t| set = t.set_shadow(name, light, dark));
+        set
+    }
+
     /// Its design tokens.
     pub fn tokens(&self) -> &Tokens {
         &self.tokens
@@ -448,9 +457,11 @@ fn apply_onto(tokens: &mut Tokens, base: &Tokens, json: &str) -> Result<Vec<Stri
 /// `light`'s in the light one (and the dark one when `dark` leaves them
 /// out), `dark`'s in the dark one. A color may name another
 /// (`var(--ring)`, in `color-mix()` too) of the same appearance: the
-/// file's or the one under it. Values of no kind a token has (shadows,
-/// letter spacing) are left out, as they are of no Tailwind utility NSH
-/// draws with a token. A value written as a color that is none is left
+/// file's or the one under it. A `shadow-*` whose values are
+/// `box-shadow`s is a shadow (Tailwind 4's `--shadow-*`); one that is not
+/// (`shadow-color`, `shadow-blur`) is read as any other. Values of no kind
+/// a token has (letter spacing) are left out, as they are of no Tailwind
+/// utility NSH draws with a token. A value written as a color that is none is left
 /// out, and one that is no color where the other appearance has a color
 /// gives way to that color; both are listed in `ignored`.
 fn apply_css_vars(tokens: &mut Tokens, base: &Tokens, vars: &JsonValue, ignored: &mut Vec<String>) {
@@ -491,6 +502,11 @@ fn apply_css_vars(tokens: &mut Tokens, base: &Tokens, vars: &JsonValue, ignored:
     for name in names {
         let value = dark_vars.get(name).or_else(|| light_vars.get(name));
         let Some(value) = value else { continue };
+        if name.starts_with("shadow-")
+            && tokens.set_shadow(name, light_vars.get(name).unwrap_or(value), value)
+        {
+            continue;
+        }
         if name.starts_with("font-") {
             if let Some(family) = font_family(value) {
                 tokens.set_font(name, family);
@@ -797,6 +813,36 @@ mod tests {
             assert!(ignored.is_empty(), "{value}: {ignored:?}");
             assert_eq!(theme.tokens().get("shadow-sm"), None);
         }
+    }
+
+    #[test]
+    fn box_shadows_named_shadow_are_shadows_per_appearance() {
+        let (theme, ignored) = Theme::from_json_lenient(
+            r##"{ "cssVars": {
+                "theme": { "shadow-blur": "3px" },
+                "light": { "shadow-card": "0 1px 2px #0000001a", "shadow-color": "#000000" },
+                "dark": { "shadow-card": "0 1px 2px #00000066" }
+            } }"##,
+        )
+        .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        let card = theme.tokens().shadow("shadow-card").unwrap();
+        assert_eq!(
+            (&*card.light, &*card.dark),
+            ("0 1px 2px #0000001a", "0 1px 2px #00000066")
+        );
+        // Tweakcn's parts of a shadow stay what they were.
+        assert_eq!(theme.number("shadow-blur"), Some(3.0));
+        assert!(theme.color("shadow-color").is_some());
+        assert!(theme.tokens().shadow("shadow-color").is_none());
+        let mut set = Theme::default();
+        assert!(set.set_shadow(
+            "shadow-floating",
+            "0 4px 12px #0000001f",
+            "0 4px 12px #00000066"
+        ));
+        assert!(!set.set_shadow("shadow-floating", "#000", "#000"));
+        assert!(set.tokens().shadow("shadow-floating").is_some());
     }
 
     #[test]
