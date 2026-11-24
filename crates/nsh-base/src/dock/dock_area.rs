@@ -175,6 +175,35 @@ impl Default for DockInfo {
     }
 }
 
+/// A tab group, as `renderTabBarLeading` and `renderTabBarTrailing` render it.
+#[derive(Clone, Debug, PartialEq, JsObject)]
+#[non_exhaustive]
+pub struct DockGroup {
+    /// Its stable id.
+    pub id: u64,
+    /// Which region of the dock area it belongs to.
+    pub placement: DockPlacement,
+    /// Its visible panels, in tab order.
+    pub panels: Vec<PanelId>,
+    /// Its displayed panel (`null` when none is visible).
+    #[prop(skip_none)]
+    pub active: Option<PanelId>,
+    /// Whether this group is zoomed.
+    pub zoomed: bool,
+}
+
+impl Default for DockGroup {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            placement: DockPlacement::Center,
+            panels: Vec::new(),
+            active: None,
+            zoomed: false,
+        }
+    }
+}
+
 /// What a panel allows (`panels`), the app's counterpart of `gpui-base`'s
 /// `Panel` hooks; a panel not listed allows everything.
 #[derive(Clone, Debug, Default, PartialEq, JsObject)]
@@ -193,6 +222,10 @@ pub struct DockPanelOptions {
     /// space.
     #[prop(skip_none)]
     pub visible: Option<bool>,
+    /// Hide the group's tab bar while this panel is the only visible tab
+    /// in its group (default false): for panels that draw their own header.
+    #[prop(skip_none)]
+    pub hide_tab_bar: Option<bool>,
 }
 
 impl DockPanelOptions {
@@ -288,6 +321,15 @@ pub struct DockAreaProps {
     pub render_empty: Prop<Option<Renderer<DockPlacement>>>,
     /// What follows the pointer while a tab is dragged.
     pub render_drag_preview: Prop<Option<Renderer<DockTab>>>,
+    /// Optional content rendered inside each tab bar before its tabs
+    /// (safe-area inset, leading drag handle, group actions).
+    pub render_tab_bar_leading: Prop<Option<Renderer<DockGroup>>>,
+    /// Optional content rendered inside each tab bar after its tabs; fills
+    /// the remaining space in the bar (trailing drag area, zoom button).
+    pub render_tab_bar_trailing: Prop<Option<Renderer<DockGroup>>>,
+    /// Optional non-interactive backdrop placed behind each open region
+    /// (`left`, `right`, `bottom`, `center`) while no group is zoomed.
+    pub render_region_backdrop: Prop<Option<Renderer<DockPlacement>>>,
     /// The classes of each tab group's frame.
     pub group_class: Prop<Option<SharedString>>,
     /// The style of each tab group's frame.
@@ -1028,12 +1070,14 @@ fn regular_view(a: AreaCx) -> impl IntoElement {
         .child(
             // The layout stays placed while a group is zoomed, so what it
             // shows keeps its state; the zoomed group's own view places
-            // that group's panels last, which shows them there.
+            // that group's panels last, which shows them there. It and the
+            // center's column clip the docks that slide out past their edges.
             view()
                 .flex_1()
                 .flex_row()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
+                .overflow_hidden()
                 .style_when(move || zoomed().is_some(), |s| s.hidden())
                 .child(dock_frame(a, DockPlacement::Left))
                 .child(
@@ -1042,10 +1086,13 @@ fn regular_view(a: AreaCx) -> impl IntoElement {
                         .flex_col()
                         .min_w(px(0.0))
                         .min_h(px(0.0))
+                        .overflow_hidden()
                         .child(
                             view()
+                                .relative()
                                 .flex_1()
                                 .min_h(px(0.0))
+                                .child(region_backdrop(a, DockPlacement::Center))
                                 .child(region(a, DockPlacement::Center)),
                         )
                         .child(dock_frame(a, DockPlacement::Bottom)),
@@ -1199,7 +1246,8 @@ fn split_view(a: AreaCx, node: NodeId) -> AnyElement {
 /// The dock at `placement`, while the area has one: a frame as wide (or
 /// tall) as the dock, its chrome and its layout, and the handle that
 /// resizes it on the side facing the center. A closed dock takes no space
-/// and stays placed, hidden, so its panels keep their state.
+/// and stays placed, out of sight past the area's edge, so its panels keep
+/// their state; opening and closing slide it while the center resizes.
 fn dock_frame(a: AreaCx, placement: DockPlacement) -> AnyElement {
     let has = computed(move || a.area.with(|area| area.dock(placement).is_some()));
     when(
@@ -1225,6 +1273,17 @@ fn dock_frame(a: AreaCx, placement: DockPlacement) -> AnyElement {
             };
             let open = move || info.get().is_some_and(|info| info.open);
             let terminal = crate::terminal::is_terminal();
+            // Opening and closing slide the frame in and out past its edge
+            // while the center resizes with it, on the reveals' spring:
+            // the frame keeps its size, so the dock's content moves rather
+            // than lays out again on each frame. A terminal shows it or not.
+            let frame = element_ref();
+            let shown = crate::collapsible::follow_open(
+                open.into_reactive(),
+                (move || !terminal).into_reactive(),
+                (|| None::<nsh_core::element::Spring>).into_reactive(),
+                frame,
+            );
             let (axis, edge) = match placement {
                 DockPlacement::Left => (Axis::Horizontal, HandleEdge::Trailing),
                 DockPlacement::Right => (Axis::Horizontal, HandleEdge::Leading),
@@ -1236,6 +1295,7 @@ fn dock_frame(a: AreaCx, placement: DockPlacement) -> AnyElement {
                 -1.0
             };
             view()
+                .element_ref(&frame)
                 .relative()
                 // Its size, unless the area is too small for it and the
                 // center's minimum: then it shrinks with the rest.
@@ -1245,20 +1305,38 @@ fn dock_frame(a: AreaCx, placement: DockPlacement) -> AnyElement {
                 .min_h(px(0.0))
                 .flex_col()
                 .overflow_hidden()
-                .style_with(move |s| match placement {
-                    // A terminal keeps no explicit height for a box of
-                    // content: the dock's rows are its basis in the column.
-                    // Its handle's line takes a Cell of its own on the
-                    // edge it hugs, not one of the dock's tabs or content.
-                    DockPlacement::Bottom if terminal => s.basis(size()).pt(px(24.0)),
-                    DockPlacement::Left if terminal => s.w(size()).pr(px(8.0)),
-                    DockPlacement::Right if terminal => s.w(size()).pl(px(8.0)),
-                    DockPlacement::Bottom => s.h(size()),
-                    _ => s.w(size()),
+                .style_with(move |s| {
+                    let s = match placement {
+                        // A terminal keeps no explicit height for a box of
+                        // content: the dock's rows are its basis in the
+                        // column. Its handle's line takes a Cell of its own
+                        // on the edge it hugs, not one of the dock's tabs or
+                        // content.
+                        DockPlacement::Bottom if terminal => s.basis(size()).pt(px(24.0)),
+                        DockPlacement::Left if terminal => s.w(size()).pr(px(8.0)),
+                        DockPlacement::Right if terminal => s.w(size()).pl(px(8.0)),
+                        DockPlacement::Bottom => s.h(size()),
+                        _ => s.w(size()),
+                    };
+                    if terminal || open() {
+                        return s;
+                    }
+                    // Closed: as large as open, past the area's edge (its
+                    // parents clip it), taking no space.
+                    match placement {
+                        DockPlacement::Left => s.ml(-size()),
+                        DockPlacement::Right => s.mr(-size()),
+                        _ => s.mb(-size()),
+                    }
                 })
-                .style_when(move || !open(), |s| s.hidden())
+                // Out of sight once it has slid out. It stays laid out at its
+                // size, so opening slides it in from there, and its panels
+                // keep their state; a terminal leaves it out of the layout.
+                .style_when(move || !terminal && !shown.get(), |s| s.invisible())
+                .style_when(move || terminal && !shown.get(), |s| s.hidden())
                 .app_class(a.props.dock_class)
                 .inline_style(a.props.dock_style)
+                .child(region_backdrop(a, placement))
                 .child(dynamic(move || {
                     let info = info.get()?;
                     a.props
@@ -1336,6 +1414,21 @@ pub(crate) fn dock_key(placement: DockPlacement) -> &'static str {
         DockPlacement::Bottom => "bottom",
         DockPlacement::Center => "center",
     }
+}
+
+fn region_backdrop(a: AreaCx, placement: DockPlacement) -> AnyElement {
+    dynamic(move || {
+        a.props.render_region_backdrop.get().map(|r| {
+            r.render(dock_key(placement), placement)
+                .absolute()
+                .inset_0()
+                .grid()
+                .grid_cols(1)
+                .grid_rows(1)
+                .pointer_events(PointerEvents::None)
+        })
+    })
+    .into_element()
 }
 
 /// How big the dock at `placement` may be in this area (tracked).

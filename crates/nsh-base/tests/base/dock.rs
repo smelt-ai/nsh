@@ -9,8 +9,8 @@
 //! The app controls the layout: what it shows is what the area reported.
 
 use nsh_base::dock::{
-    DockArea, DockAreaApi, DockAreaEvent, DockAreaLayout, DockLayout, DockNode, DockPanel,
-    DockPlacement, DockRegion, DockTab, PanelId, dock_area,
+    DockArea, DockAreaApi, DockAreaEvent, DockAreaLayout, DockGroup, DockLayout, DockNode,
+    DockPanel, DockPanelOptions, DockPlacement, DockRegion, DockTab, PanelId, dock_area,
 };
 use nsh_core::{
     Size, ViewKind,
@@ -92,6 +92,13 @@ fn with_two_docks() -> DockAreaLayout {
     with_files().with_dock(
         DockPlacement::Bottom,
         DockRegion::new(DockLayout::tabs().panel("terminal")),
+    )
+}
+
+fn with_outline() -> DockAreaLayout {
+    two_groups().with_dock(
+        DockPlacement::Right,
+        DockRegion::new(DockLayout::tabs().panel("outline")),
     )
 }
 
@@ -239,6 +246,10 @@ fn Workspace(props: WorkspaceProps) -> impl IntoElement {
                 .child(button(
                     "toggle-bottom",
                     Box::new(|a| a.toggle_dock(DockPlacement::Bottom)),
+                ))
+                .child(button(
+                    "toggle-right",
+                    Box::new(|a| a.toggle_dock(DockPlacement::Right)),
                 ))
                 .child(button(
                     "zoom-a",
@@ -504,6 +515,55 @@ fn a_dock_opens_and_closes_and_keeps_its_panels() {
     app.wait_for("Layout h([*a b]:400 [*c]) left [*files] open 200")
         .unwrap();
     app.wait_for("Panel files").unwrap();
+}
+
+/// Closing the dock that shows `panel` (its toggle `toggle`) slides it past
+/// the area's edge rather than leaving it out of the layout: its panel
+/// stays laid out at the dock's size (and so slides in from there), while
+/// the center's `measure` (of the sizes of its panels) grows by the dock's
+/// 200; opening gives the dock its place back.
+fn assert_slides(
+    layout: DockAreaLayout,
+    panel: &str,
+    toggle: &str,
+    measure: fn(&std::collections::BTreeMap<String, (f32, f32)>) -> f32,
+) {
+    let shown = format!("Panel {panel}");
+    let mut app = start(layout, 1000.0);
+    app.wait_for(&shown).unwrap();
+    app.wait(std::time::Duration::from_millis(100)).unwrap();
+    let open = sizes(&app);
+
+    app.press(toggle).unwrap();
+    app.wait_for_gone(&shown, std::time::Duration::from_secs(5))
+        .unwrap();
+    app.wait(std::time::Duration::from_millis(100)).unwrap();
+    let closed = sizes(&app);
+    assert_eq!(closed[panel], open[panel], "{panel}: {closed:?}");
+    assert_eq!(
+        measure(&closed),
+        measure(&open) + 200.0,
+        "{panel}: {closed:?}"
+    );
+
+    app.press(toggle).unwrap();
+    app.wait_for(&shown).unwrap();
+    app.wait(std::time::Duration::from_millis(100)).unwrap();
+    let reopened = sizes(&app);
+    assert_eq!(measure(&reopened), measure(&open), "{panel}: {reopened:?}");
+}
+
+#[test]
+fn a_closed_side_dock_slides_out_at_its_size_and_the_center_takes_its_place() {
+    let width = |s: &std::collections::BTreeMap<String, (f32, f32)>| s["a"].0 + s["c"].0;
+    assert_slides(with_files(), "files", "id:toggle-left", width);
+    assert_slides(with_outline(), "outline", "id:toggle-right", width);
+}
+
+#[test]
+fn a_closed_bottom_dock_slides_out_at_its_size_and_the_center_takes_its_place() {
+    let height = |s: &std::collections::BTreeMap<String, (f32, f32)>| s["a"].1;
+    assert_slides(with_two_docks(), "terminal", "id:toggle-bottom", height);
 }
 
 /// A method naming a tab or panel the layout does not have runs at the
@@ -898,6 +958,117 @@ fn a_compact_bottom_dock_lifted_by_the_keyboard_stays_below_the_status_bar() {
         label.bottom() <= px(844.0 - 336.0),
         "the drawer's content above the keyboard: {label:?}"
     );
+}
+
+#[component]
+fn CustomBarWorkspace() -> impl IntoElement {
+    let mut left = DockRegion::new(DockLayout::tabs().panel("sidebar"));
+    left.size = Some(px(240.0));
+    let mut right = DockRegion::new(DockLayout::tabs().panel("files").panel("git"));
+    right.size = Some(px(260.0));
+    let layout = signal(
+        DockAreaLayout::new(DockLayout::tabs().panel("center"))
+            .with_dock(DockPlacement::Left, left)
+            .with_dock(DockPlacement::Right, right),
+    );
+    let mut sidebar_opts = DockPanelOptions::new("sidebar");
+    sidebar_opts.hide_tab_bar = Some(true);
+    let mut center_opts = DockPanelOptions::new("center");
+    center_opts.hide_tab_bar = Some(true);
+    let panels = vec![sidebar_opts, center_opts];
+    let dock = dock_area()
+        .layout(move || Some(layout.get()))
+        .on_layout_change(move |next: &DockAreaLayout| layout.set(next.clone()))
+        .compact(Some(false))
+        .panels(panels)
+        .tab_bar_class("flex flex-row items-center h-[34px]")
+        .render_tab_bar_leading(move |group: &DockGroup| {
+            let id = format!("lead-{:?}", group.placement);
+            view()
+                .test_id(id.as_str())
+                .child(text(format!(
+                    "Lead:{:?}:{}",
+                    group.placement,
+                    group.panels.len()
+                )))
+        })
+        .render_tab_bar_trailing(move |group: &DockGroup| {
+            let id = format!("trail-{:?}", group.placement);
+            view()
+                .test_id(id.as_str())
+                .child(text(format!("Trail:{:?}", group.placement)))
+        })
+        .render_region_backdrop(move |placement: &DockPlacement| {
+            let id = format!("backdrop-{placement:?}");
+            view()
+                .test_id(id.as_str())
+                .child(text(format!("Backdrop:{placement:?}")))
+        })
+        .render_tab(|tab: &DockTab| {
+            let id = format!("ctab-{}", tab.panel);
+            view()
+                .test_id(id.as_str())
+                .child(text(format!("CTab {}", tab.panel)))
+        })
+        .render_panel(|panel: &DockPanel| {
+            let id = format!("cpanel-{}", panel.id);
+            view()
+                .flex_1()
+                .test_id(id.as_str())
+                .child(text(format!("CPanel {}", panel.id)))
+        });
+    view().w(px(1000.0)).h(px(600.0)).flex_col().child(dock.flex_1())
+}
+
+#[test]
+fn hide_tab_bar_tab_bar_slots_and_region_backdrops_work() {
+    let config = EngineConfig {
+        viewport: Size::new(px(1000.0), px(600.0)),
+        ..EngineConfig::new(nsh_testing::windowed_root::<CustomBarWorkspace>())
+    };
+    let mut app = Headless::start(config).expect("the engine starts");
+    app.wait_for("CPanel center").unwrap();
+    // Single panels with hide_tab_bar=true fill from y=0 with no visible tab bar.
+    assert!(app.shows("CPanel sidebar"));
+    assert!(app.shows("CPanel files"));
+    assert!(app.shows("Lead:Right:2"));
+    assert!(app.shows("Trail:Right"));
+    assert!(app.shows("Backdrop:Left"));
+    assert!(app.shows("Backdrop:Center"));
+    assert!(app.shows("Backdrop:Right"));
+
+    let nodes = app.screen().layout_nodes();
+    let sidebar_panel = nodes
+        .iter()
+        .find(|n| n.test_id.as_deref() == Some("cpanel-sidebar"))
+        .expect("sidebar panel")
+        .bounds;
+    let center_panel = nodes
+        .iter()
+        .find(|n| n.test_id.as_deref() == Some("cpanel-center"))
+        .expect("center panel")
+        .bounds;
+    let files_panel = nodes
+        .iter()
+        .find(|n| n.test_id.as_deref() == Some("cpanel-files"))
+        .expect("files panel")
+        .bounds;
+    let left_backdrop = nodes
+        .iter()
+        .find(|n| n.test_id.as_deref() == Some("backdrop-Left"))
+        .expect("left backdrop")
+        .bounds;
+    assert_eq!(sidebar_panel.origin.y, px(0.0), "hidden tab bar takes 0px");
+    assert_eq!(center_panel.origin.y, px(0.0), "hidden tab bar takes 0px");
+    assert_eq!(files_panel.origin.y, px(34.0), "multi-tab group keeps 34px tab bar");
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| matches!(n.test_id.as_deref(), Some("ctab-sidebar" | "ctab-center" | "lead-Left" | "lead-Center" | "trail-Left" | "trail-Center"))),
+        "hide_tab_bar=true must not mount the tab bar or its renderers even when tab_bar_class sets display:flex"
+    );
+    assert_eq!(left_backdrop.size.width, px(240.0));
+    assert_eq!(left_backdrop.size.height, px(600.0));
 }
 
 /// Eight panels in one group, their tabs 80 wide, in an area 300 wide: the

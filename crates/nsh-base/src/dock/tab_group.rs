@@ -46,9 +46,12 @@ use nsh_core::{
 
 use super::{
     area::Group,
-    dock_area::{AreaCx, DockDropIndicator, DockPanel, DockTab, DropAt, GroupRefs, TabDrag, Zone},
+    dock_area::{
+        AreaCx, DockDropIndicator, DockGroup, DockPanel, DockTab, DropAt, GroupRefs, TabDrag, Zone,
+    },
     drag::{DropPlaceholderBounds, split_placement_at},
     layout::{InsertTarget, NodeId, PanelId},
+    state::DockPlacement,
 };
 
 /// How far the pointer moves on a tab before it drags it.
@@ -85,6 +88,29 @@ pub(crate) fn tab_value(a: AreaCx, panel: &PanelId) -> Option<DockTab> {
     })
 }
 
+/// What `renderTabBarLeading` and `renderTabBarTrailing` get for group `node` (tracked).
+pub(crate) fn group_value(a: AreaCx, node: NodeId) -> Option<DockGroup> {
+    let group = a.area.with(|area| area.group(node))?;
+    let placement = a
+        .area
+        .with(|area| area.placement_of_node(node))
+        .unwrap_or(DockPlacement::Center);
+    let panels: Vec<PanelId> = group
+        .panels
+        .iter()
+        .filter(|p| a.visible(p))
+        .cloned()
+        .collect();
+    let active = shown_of(a, &group);
+    Some(DockGroup {
+        id: node.as_u64(),
+        placement,
+        panels,
+        active,
+        zoomed: a.zoomed.get() == Some(node),
+    })
+}
+
 /// The toolbar at the end of the tab bar of `group`: what `renderToolbar`
 /// draws for its displayed tab, nothing without the prop or a shown panel.
 pub(crate) fn toolbar(a: AreaCx, group: Memo<Option<Group>>) -> AnyElement {
@@ -113,6 +139,7 @@ pub(crate) fn tab_strip(tabs: impl IntoElement) -> AnyElement {
         .into_element()
 }
 
+
 /// Tab group `node`: its frame, tab bar and content frame.
 pub(crate) fn tab_group(a: AreaCx, node: NodeId) -> AnyElement {
     let group = computed(move || a.area.with(|area| area.group(node)));
@@ -126,6 +153,12 @@ pub(crate) fn tab_group(a: AreaCx, node: NodeId) -> AnyElement {
             .collect::<Vec<_>>()
     });
     let shown = computed(move || group.with(|g| g.as_ref().and_then(|g| shown_of(a, g))));
+    let hide_bar = computed(move || {
+        let visible = tabs.get();
+        visible.is_empty()
+            || (visible.len() == 1 && a.options(&visible[0]).hide_tab_bar.unwrap_or(false))
+    });
+    let group_info = computed(move || group_value(a, node));
     let refs = GroupRefs {
         group: Some(node),
         bar: element_ref(),
@@ -133,6 +166,7 @@ pub(crate) fn tab_group(a: AreaCx, node: NodeId) -> AnyElement {
         tabs: Rc::default(),
     };
     a.register(refs.clone());
+    let bar_ref = refs.bar;
     let tab_refs = refs.tabs.clone();
     let content = refs.content.expect("a group's content");
     view()
@@ -142,26 +176,50 @@ pub(crate) fn tab_group(a: AreaCx, node: NodeId) -> AnyElement {
         .min_h(px(0.0))
         .app_class(a.props.group_class)
         .inline_style(a.props.group_style)
-        .child(
-            view()
-                .role(AccessibilityRole::Tablist)
-                .element_ref(&refs.bar)
-                .app_class(a.props.tab_bar_class)
-                .inline_style(a.props.tab_bar_style)
-                .child(tab_strip(each(
-                    move || tabs.get(),
-                    |panel: &PanelId| panel.clone(),
-                    move |panel, _| {
-                        let id = panel.get_untracked();
-                        let value = {
-                            let id = id.clone();
-                            computed(move || tab_value(a, &id))
-                        };
-                        tab(a, id, Some(node), value, content, tab_refs.clone())
-                    },
-                )))
-                .child(toolbar(a, group)),
-        )
+        .child(when(
+            move || !hide_bar.get(),
+            move || {
+                let tab_refs = tab_refs.clone();
+                view()
+                    .role(AccessibilityRole::Tablist)
+                    .element_ref(&bar_ref)
+                    .app_class(a.props.tab_bar_class)
+                    .inline_style(a.props.tab_bar_style)
+                    .child(dynamic(move || {
+                        let info = group_info.get()?;
+                        a.props.render_tab_bar_leading.get().map(|r| {
+                            r.render(format!("lead:{}", node.as_u64()), info)
+                                .flex_shrink(0.0)
+                                .flex_row()
+                                .items_center()
+                        })
+                    }))
+                    .child(tab_strip(each(
+                        move || tabs.get(),
+                        |panel: &PanelId| panel.clone(),
+                        move |panel, _| {
+                            let id = panel.get_untracked();
+                            let value = {
+                                let id = id.clone();
+                                computed(move || tab_value(a, &id))
+                            };
+                            tab(a, id, Some(node), value, content, tab_refs.clone())
+                        },
+                    )))
+                    .child(dynamic(move || {
+                        let info = group_info.get()?;
+                        a.props.render_tab_bar_trailing.get().map(|r| {
+                            r.render(format!("trail:{}", node.as_u64()), info)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .grid()
+                                .grid_cols(1)
+                                .grid_rows(1)
+                        })
+                    }))
+                    .child(toolbar(a, group))
+            },
+        ))
         .child(
             view()
                 .role(AccessibilityRole::TabPanel)
