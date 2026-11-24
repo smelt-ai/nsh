@@ -2311,6 +2311,62 @@ fn colors_drawn_from_the_text_keep_its_typesetting() {
 }
 
 #[test]
+fn inline_text_span_opacity_scales_color_without_relayout() {
+    let mut c = three_words(true, Vec::new());
+    c.apply(style_op(10, &[("color", StyleValue::Str("#ffffff"))]))
+        .unwrap();
+    c.apply(style_op(14, &[("opacity", StyleValue::Number(0.5))]))
+        .unwrap();
+    // Nested child span inside span 14 overrides color to pure red; outer 0.5 opacity still applies.
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 20,
+                tag: Tag::Text,
+            },
+            style_op(20, &[("color", StyleValue::Str("#ff0000"))]),
+            Op::CreateText {
+                id: 21,
+                text: "!".into(),
+            },
+            Op::Insert {
+                parent: 20,
+                child: 21,
+                before: None,
+            },
+            Op::Insert {
+                parent: 14,
+                child: 20,
+                before: None,
+            },
+        ],
+    );
+    let (text, first, _) = mounted_words(&c.commit().unwrap()).expect("mounted");
+    assert_eq!(text.spans[1].style.color, Color(0xffff_ff80));
+    assert_eq!(text.spans[2].style.color, Color(0xff00_0080));
+    let before = engine_counts(&c);
+
+    for (opacity, expected_white, expected_red) in [
+        (0.0_f32, Color(0xffff_ff00), Color(0xff00_0000)),
+        (1.0_f32, Color(0xffff_ffff), Color(0xff00_00ff)),
+    ] {
+        c.apply(style_op(14, &[("opacity", StyleValue::Number(opacity))]))
+            .unwrap();
+        let batch = c.commit().unwrap();
+        assert_eq!(batch.items.len(), 1, "only the text: {:?}", batch.items);
+        let (text, layout, _) = mounted_words(&batch).expect("the new text mounted");
+        assert!(
+            Arc::ptr_eq(&layout.0, &first.0),
+            "opacity update must keep layout"
+        );
+        assert_eq!(engine_counts(&c), before, "must not re-typeset or relayout");
+        assert!(text.spans.iter().any(|s| s.style.color == expected_white));
+        assert!(text.spans.iter().any(|s| s.style.color == expected_red));
+    }
+}
+
+#[test]
 fn hidden_words_drawn_from_the_text_keep_its_typesetting() {
     let visibility = |id, v| style_op(id, &[("visibility", StyleValue::Str(v))]);
     // The last two words are queued: hidden, in their place in the lines.

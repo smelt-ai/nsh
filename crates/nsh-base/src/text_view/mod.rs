@@ -12,6 +12,7 @@ mod markdown;
 #[cfg(feature = "math")]
 mod math;
 mod parts;
+mod reveal;
 mod selection;
 mod tex_text;
 mod view;

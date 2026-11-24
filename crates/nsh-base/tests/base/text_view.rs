@@ -1135,6 +1135,267 @@ mod word_fade {
     }
 }
 
+mod streaming_fade {
+    use std::{
+        cell::{Cell, RefCell},
+        time::{Duration, SystemTime},
+    };
+
+    use nsh_base::{MarkdownOptions, text_view};
+    use nsh_core::{
+        ApproxTextEngine, AttributedText, Core, EventKind, EventPayload, MountBatch, MountItem,
+        NodeId, Points, ROOT_ID, Size, TextEngine, TextLayout, TextLine, element::Root,
+        prelude::*, time::Clock,
+    };
+
+    type Step = Box<dyn FnOnce(Signal<String>, Signal<bool>)>;
+
+    thread_local! {
+        static TYPESET: Cell<usize> = const { Cell::new(0) };
+        static CONFIG: RefCell<(String, bool)> = const { RefCell::new((String::new(), false)) };
+        static STEP: RefCell<Option<Step>> = const { RefCell::new(None) };
+    }
+
+    struct ColorsAtDraw;
+
+    impl TextEngine for ColorsAtDraw {
+        type Prepared = <ApproxTextEngine as TextEngine>::Prepared;
+
+        fn prepare(&self, text: &AttributedText) -> Self::Prepared {
+            TYPESET.set(TYPESET.get() + text.text.len());
+            ApproxTextEngine.prepare(text)
+        }
+
+        fn measure(&self, prepared: &Self::Prepared, max_width: Option<Points>) -> Size<Points> {
+            TYPESET.set(TYPESET.get() + prepared.chars());
+            ApproxTextEngine.measure(prepared, max_width)
+        }
+
+        fn draws_colors_from_text(&self) -> bool {
+            true
+        }
+
+        fn breaks_lines_greedily(&self) -> bool {
+            ApproxTextEngine.breaks_lines_greedily()
+        }
+
+        fn layout(&self, prepared: &Self::Prepared, size: Size<Points>) -> TextLayout {
+            TYPESET.set(TYPESET.get() + prepared.chars());
+            ApproxTextEngine.layout(prepared, size)
+        }
+
+        fn lines(&self, layout: &TextLayout) -> Vec<TextLine> {
+            ApproxTextEngine.lines(layout)
+        }
+
+        fn attachments(&self, layout: &TextLayout) -> Vec<Option<Point<Points>>> {
+            ApproxTextEngine.attachments(layout)
+        }
+    }
+
+    #[component]
+    fn Harness() -> impl IntoElement {
+        let (initial, fade) = CONFIG.with_borrow(|c| c.clone());
+        let md = signal(initial);
+        let streaming = signal(fade);
+        view()
+            .flex_1()
+            .on_press(move || {
+                if let Some(step) = STEP.with_borrow_mut(Option::take) {
+                    step(md, streaming);
+                }
+            })
+            .child(
+                text_view()
+                    .markdown(move || Some(SharedString::from(md.get())))
+                    .options(move || MarkdownOptions {
+                        streaming: streaming.get(),
+                        ..MarkdownOptions::default()
+                    })
+                    .streaming_fade(move || streaming.get()),
+            )
+    }
+
+    fn mount_stream(initial: &str, fade: bool) -> (Core<ColorsAtDraw>, NodeId) {
+        CONFIG.with_borrow_mut(|c| *c = (initial.to_owned(), fade));
+        let mut core = Core::new(ColorsAtDraw, Size::new(px(720.0), px(900.0)));
+        core.mount_root(&Root::new::<Harness>(|| ()));
+        let batch = core.commit().expect("first frame");
+        core.run_component_tasks();
+        let host = batch
+            .items
+            .iter()
+            .find_map(|i| match i {
+                MountItem::Insert {
+                    parent: ROOT_ID,
+                    child,
+                    ..
+                } => Some(*child),
+                _ => None,
+            })
+            .expect("harness host");
+        (core, host)
+    }
+
+    fn update_stream(
+        core: &mut Core<ColorsAtDraw>,
+        host: NodeId,
+        f: impl FnOnce(Signal<String>, Signal<bool>) + 'static,
+    ) -> Option<MountBatch> {
+        STEP.with_borrow_mut(|s| *s = Some(Box::new(f)));
+        assert!(core.component_event(host, EventKind::Press, &EventPayload::None));
+        let batch = core.commit();
+        core.run_component_tasks();
+        batch
+    }
+
+    fn pump_frame(
+        core: &mut Core<ColorsAtDraw>,
+        clock: &Clock,
+    ) -> Option<AttributedText> {
+        let next = clock.now() + Duration::from_millis(16);
+        clock.advance_to(next);
+        core.run_frame(next);
+        core.run_component_tasks();
+        core.commit().and_then(|b| latest_text_from_batch(&b))
+    }
+
+    fn latest_text_from_batch(batch: &MountBatch) -> Option<AttributedText> {
+        batch.items.iter().rev().find_map(|i| match i {
+            MountItem::Text { text, .. } => Some((**text).clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn streaming_fade_animates_new_segments_with_zero_relayout_and_stops_idle() {
+        let clock = Clock::manual(SystemTime::UNIX_EPOCH);
+        let _guard = clock.enter();
+        let (mut core, host) = mount_stream("", true);
+        assert!(!core.wants_frame());
+
+        let batch = update_stream(&mut core, host, |md, _| {
+            md.set("你好，Hello world".into());
+        })
+        .expect("initial append mounts text");
+        let t0 = latest_text_from_batch(&batch).expect("mounted text");
+        assert!(
+            t0.spans.iter().any(|s| (s.style.color.0 & 0xff) < 255),
+            "expected newly streamed segments to start below full alpha: {:?}",
+            t0.spans
+        );
+        assert!(core.wants_frame(), "should request display frame while fading");
+
+        let typeset_before = TYPESET.get();
+        let mut last = t0;
+        let mut frames = 0;
+        while core.wants_frame() && frames < 40 {
+            frames += 1;
+            if let Some(t) = pump_frame(&mut core, &clock) {
+                last = t;
+            }
+        }
+        assert_eq!(
+            TYPESET.get(),
+            typeset_before,
+            "opacity frames must never re-typeset or relayout"
+        );
+        assert!(
+            !core.wants_frame(),
+            "must stop requesting display frames once settled"
+        );
+        assert!(
+            last.spans.iter().all(|s| (s.style.color.0 & 0xff) == 255),
+            "all spans should reach full alpha after settling: {:?}",
+            last.spans
+        );
+    }
+
+    #[test]
+    fn streaming_fade_off_never_fades_or_requests_frames() {
+        let clock = Clock::manual(SystemTime::UNIX_EPOCH);
+        let _guard = clock.enter();
+        let (mut core, host) = mount_stream("", false);
+
+        let batch = update_stream(&mut core, host, |md, _| {
+            md.set("你好，Hello world".into());
+        })
+        .expect("append mounts text");
+        let text = latest_text_from_batch(&batch).expect("mounted text");
+        assert!(text.spans.iter().all(|s| (s.style.color.0 & 0xff) == 255));
+        assert!(!core.wants_frame());
+    }
+
+    #[test]
+    fn streaming_fade_large_initial_mount_skips_history_fade_and_fades_appended_tail() {
+        let clock = Clock::manual(SystemTime::UNIX_EPOCH);
+        let _guard = clock.enter();
+        let history = "Settled history paragraph repeated to exceed threshold. ".repeat(4);
+        assert!(history.len() > 160);
+        let (mut core, host) = mount_stream(&history, true);
+        assert!(
+            !core.wants_frame(),
+            "large initial mount must not fade history"
+        );
+
+        let appended = format!("{history}tail words");
+        let batch = update_stream(&mut core, host, move |md, _| {
+            md.set(appended);
+        })
+        .expect("append tail mounts text");
+        let text = latest_text_from_batch(&batch).expect("mounted text");
+        assert_eq!(
+            text.spans[0].style.color.0 & 0xff,
+            255,
+            "initial history prefix must stay opaque"
+        );
+        assert!(
+            text.spans
+                .iter()
+                .skip(1)
+                .any(|s| (s.style.color.0 & 0xff) < 255),
+            "appended tail must fade in: {:?}",
+            text.spans
+        );
+        assert!(core.wants_frame());
+    }
+
+    #[test]
+    fn streaming_fade_toggle_off_mid_fade_finishes_smoothly() {
+        let clock = Clock::manual(SystemTime::UNIX_EPOCH);
+        let _guard = clock.enter();
+        let (mut core, host) = mount_stream("", true);
+
+        let batch = update_stream(&mut core, host, |md, _| {
+            md.set("Streaming answer".into());
+        })
+        .expect("append mounts text");
+        let first = latest_text_from_batch(&batch).expect("mounted text");
+        assert!(first.spans.iter().any(|s| (s.style.color.0 & 0xff) < 255));
+        assert!(core.wants_frame());
+
+        // Turn streaming off mid-fade: active tail keeps fading smoothly instead of snapping.
+        let _ = update_stream(&mut core, host, |_, streaming| {
+            streaming.set(false);
+        });
+        assert!(
+            core.wants_frame(),
+            "in-flight fade must continue after streaming flips false"
+        );
+
+        let mut last = first;
+        let mut frames = 0;
+        while core.wants_frame() && frames < 40 {
+            frames += 1;
+            if let Some(t) = pump_frame(&mut core, &clock) {
+                last = t;
+            }
+        }
+        assert!(!core.wants_frame());
+        assert!(last.spans.iter().all(|s| (s.style.color.0 & 0xff) == 255));
+    }
+}
+
 const TASKS: &str = "- [ ] first\n- [x] second\n  - [ ] nested\n\n<details>\n<summary>More</summary>\n\n\
                      - [x] hidden\n\n</details>\n\n> - [ ] last";
 

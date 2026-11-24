@@ -4928,11 +4928,12 @@ impl<M: TextEngine> Core<M> {
         } else {
             node.view_style != view
         };
-        // A span's background and visibility are part of its block's text.
+        // A span's background, opacity and visibility are part of its block's text.
         let span_drawing_changed = node.inline
             && node.kind == Kind::Text
             && (span_background(&node.view_style, node.id) != span_background(&view, node.id)
-                || node.view_style.hidden != view.hidden);
+                || node.view_style.hidden != view.hidden
+                || node.view_style.opacity != view.opacity);
         let text_changed = node.text_style != text || span_drawing_changed;
         // What its children inherit as `currentColor`.
         let passed_color = |node: &Node, text: &TextStyle| text.color.or(node.inherited_color);
@@ -9007,7 +9008,7 @@ impl<M: TextEngine> Core<M> {
             baselines: &baselines,
             next_baseline: 0,
         };
-        self.collect_text(key, base, &mut text, &mut parts, false);
+        self.collect_text(key, base, 1.0, &mut text, &mut parts, false);
         let TextAttachments {
             alignments,
             spacers,
@@ -9111,12 +9112,13 @@ impl<M: TextEngine> Core<M> {
         &self,
         key: Key,
         style: ResolvedTextStyle,
+        opacity: f32,
         out: &mut AttributedText,
         parts: &mut TextAttachments<'_>,
         in_press: bool,
     ) {
         if let Some(text) = self.folded_text(key) {
-            out.push(text, style);
+            out.push(text, style.with_opacity(opacity));
         }
         for &c in &self.nodes[key as usize].children {
             let child = &self.nodes[c as usize];
@@ -9124,7 +9126,7 @@ impl<M: TextEngine> Core<M> {
                 continue;
             }
             match child.kind {
-                Kind::RawText => out.push(&child.text, style),
+                Kind::RawText => out.push(&child.text, style.with_opacity(opacity)),
                 Kind::Text => {
                     let start = out.len_utf16();
                     let mut inner = style.inherit(&child.text_style);
@@ -9137,6 +9139,7 @@ impl<M: TextEngine> Core<M> {
                     if inner.hidden || child.view_style.hidden {
                         inner = inner.hide();
                     }
+                    let inner_opacity = (opacity * child.view_style.opacity).clamp(0.0, 1.0);
                     let press = pressable(child.events);
                     let hinted = child.overlay_watched & overlay::watch::HINT != 0;
                     // Read from the classes, not `tracked`, which may be
@@ -9150,11 +9153,14 @@ impl<M: TextEngine> Core<M> {
                     let pad = |out: &mut AttributedText, spacers: &mut Vec<u32>, w: f32| {
                         if w > 0.0 {
                             spacers.push(out.len_utf16());
-                            out.push_attachment(crate::geometry::size_pt(w, 0.0), inner);
+                            out.push_attachment(
+                                crate::geometry::size_pt(w, 0.0),
+                                inner.with_opacity(inner_opacity),
+                            );
                         }
                     };
                     pad(out, &mut parts.spacers, first);
-                    self.collect_text(c, inner, out, parts, in_press || press);
+                    self.collect_text(c, inner, inner_opacity, out, parts, in_press || press);
                     pad(out, &mut parts.spacers, last);
                     // A link with a hint (its URL) hears the pointer come
                     // over its characters and leave them. A span that takes
@@ -9229,7 +9235,7 @@ impl<M: TextEngine> Core<M> {
                             out,
                             crate::geometry::size_pt(size.width, size.height),
                             self.attachment_align(c),
-                            style,
+                            style.with_opacity(opacity),
                         );
                     }
                 }

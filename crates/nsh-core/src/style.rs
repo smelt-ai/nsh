@@ -56,6 +56,16 @@ impl Color {
         self.0 & 0xff == 0
     }
 
+    /// Returns this color with its alpha channel scaled by `opacity` (`0.0..=1.0`).
+    #[inline]
+    pub(crate) fn with_opacity(self, opacity: f32) -> Color {
+        if opacity >= 1.0 {
+            return self;
+        }
+        let a = (((self.0 & 0xff) as f32) * opacity.clamp(0.0, 1.0)).round() as u32;
+        Color((self.0 & !0xff) | a.min(0xff))
+    }
+
     /// Parses a CSS color: hex, `rgb()` / `rgba()`, `hsl()` / `hsla()`,
     /// `oklch()`, `oklab()` or a CSS named color.
     pub fn parse(s: &str) -> Option<Color> {

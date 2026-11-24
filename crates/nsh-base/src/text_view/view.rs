@@ -16,6 +16,7 @@ use super::{
     ListItem, MarkdownExtension, MarkdownOptions, MarkdownPlugins, Parser, Table,
     markdown::{Incremental, Parsed, SharedBlock},
     parts::{TextViewClasses, TextViewPart as Part, TextViewParts, TextViewStyles},
+    reveal::{FadeSpan, Reveal},
     selection::{Reported, Source, TextSelectionOptions, selected},
 };
 use crate::{
@@ -74,6 +75,11 @@ pub struct TextViewProps {
     /// Shown inline at the end of the last block (a streaming reply's
     /// caret).
     pub streaming_caret: Prop<Option<Slot>>,
+    /// Smoothly fades newly appended text segments in while streaming
+    /// without re-laying out settled text (default false). Respects
+    /// `reduce_motion()` and is disabled in terminals.
+    #[prop(default)]
+    pub streaming_fade: Prop<bool>,
     /// Shows a custom node (an extension's or the document's): `node.name`
     /// tells which. Without it, a custom node shows its content.
     pub render_custom: Prop<Option<Renderer<CustomNode>>>,
@@ -298,6 +304,16 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
     // the blocks before are the ones made earlier, shared, so comparing
     // the documents and the rows compares pointers there.
     let read = std::cell::RefCell::new(Incremental::default());
+    let reveal = Reveal::new();
+    cleanup({
+        let reveal = reveal.clone();
+        move || reveal.dispose()
+    });
+    effect({
+        let reveal = reveal.clone();
+        move || reveal.set_enabled(props.streaming_fade.get())
+    });
+    let parse_reveal = reveal.clone();
     let document = computed(move || {
         let parser = || {
             Parser::new()
@@ -306,8 +322,10 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
                 .plugins(&parser_plugins)
         };
         if let Some(markdown) = props.markdown.get() {
+            parse_reveal.sync_source(Some(&markdown), props.streaming_fade.get_untracked());
             return read.borrow_mut().parse(&parser(), &markdown);
         }
+        parse_reveal.sync_source(None, false);
         read.borrow_mut().clear();
         if let Some(html) = props.html.get() {
             parser().html(&html).into()
@@ -350,6 +368,8 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
     let plugins = Rc::new(plugins);
     let row_plugins = plugins.clone();
     let math_loaded = signal(false);
+    let footnotes_reveal = reveal.clone();
+    let row_reveal = reveal.clone();
     let reported = Rc::new(std::cell::RefCell::new(Reported::default()));
     cx.methods(TextViewApi {
         document,
@@ -397,10 +417,11 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
             |row: &Row| (row.index, row.block.kind().to_owned()),
             move |row, _| {
                 let plugins = row_plugins.clone();
+                let row_reveal = row_reveal.clone();
                 // A node as the row's root: an `Each` keeps rows by their
                 // root's key, which a region has none of.
                 view().child(dynamic(move || {
-                    let cx = Cx::read(&props, cx, plugins.clone(), math_loaded);
+                    let cx = Cx::read(&props, cx, plugins.clone(), math_loaded, row_reveal.clone());
                     let row = row.get();
                     cx.task.set(row.tasks_before);
                     cx.block(&row.block, &row.index.to_string(), row.last, row.before)
@@ -412,7 +433,13 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
             if notes.is_empty() {
                 return None;
             }
-            let cx = Cx::read(&props, cx, plugins.clone(), math_loaded);
+            let cx = Cx::read(
+                &props,
+                cx,
+                plugins.clone(),
+                math_loaded,
+                footnotes_reveal.clone(),
+            );
             cx.task
                 .set(document.with(|d| d.blocks.iter().map(|b| b.tasks()).sum()));
             // A terminal's blank row before them, as before a block.
@@ -524,6 +551,8 @@ struct Cx {
     plugins: Rc<MarkdownPlugins>,
     /// Set when the formula typesetter finished loading (`formula.rs`).
     math_loaded: Signal<bool>,
+    reveal: Reveal,
+    reveal_cursor: std::cell::RefCell<Option<RevealCursor>>,
     typed: TextViewParts,
     /// Whether the caret is placed in this run.
     caret_placed: Rc<std::cell::Cell<bool>>,
@@ -544,12 +573,19 @@ struct Cx {
     scope: Scope<TextViewEvent>,
 }
 
+#[derive(Clone)]
+struct RevealCursor {
+    spans: Vec<FadeSpan>,
+    offset: usize,
+}
+
 impl Cx {
     fn read(
         props: &TextViewProps,
         scope: Scope<TextViewEvent>,
         plugins: Rc<MarkdownPlugins>,
         math_loaded: Signal<bool>,
+        reveal: Reveal,
     ) -> Self {
         Self {
             classes: props.classes.get(),
@@ -567,6 +603,8 @@ impl Cx {
             render_image: props.render_image.get(),
             plugins,
             math_loaded,
+            reveal,
+            reveal_cursor: std::cell::RefCell::new(None),
             typed: use_context::<TextViewParts>().unwrap_or_default(),
             highlighter: use_context::<CodeHighlighter>(),
             caret_placed: Rc::default(),
@@ -653,9 +691,28 @@ impl Cx {
 
     /// A text of the block's inline content, selectable when asked.
     fn paragraph(&self, content: &[Inline], key: &str, tail: bool) -> Text {
+        let prev = if self.reveal.should_track_paragraph(key) {
+            let mut plain = String::new();
+            super::document::inline_text(content, &mut plain);
+            let spans = self.reveal.begin_paragraph(key, &plain);
+            if spans.is_empty() {
+                None
+            } else {
+                Some(
+                    self.reveal_cursor
+                        .replace(Some(RevealCursor { spans, offset: 0 })),
+                )
+            }
+        } else {
+            None
+        };
+        let inlines = self.inlines(content, key);
+        if let Some(prev) = prev {
+            self.reveal_cursor.replace(prev);
+        }
         let el = text("")
             .when(self.selectable, |t| t.select_text())
-            .children(self.inlines(content, key));
+            .children(inlines);
         self.caret_after(el, tail)
     }
 
@@ -1721,13 +1778,108 @@ impl Cx {
             .into_element()
     }
 
+    /// Advances the active paragraph reveal byte cursor by `len`, returning
+    /// the starting byte offset and any overlapping fade spans.
+    fn reveal_advance(&self, len: usize) -> Option<(usize, Vec<FadeSpan>)> {
+        let mut cursor_ref = self.reveal_cursor.borrow_mut();
+        let cursor = cursor_ref.as_mut()?;
+        let start = cursor.offset;
+        let end = start + len;
+        cursor.offset = end;
+        if len == 0 {
+            return None;
+        }
+        let overlapping: Vec<FadeSpan> = cursor
+            .spans
+            .iter()
+            .copied()
+            .filter(|s| s.start < end && s.end > start)
+            .collect();
+        if overlapping.is_empty() {
+            None
+        } else {
+            Some((start, overlapping))
+        }
+    }
+
+    /// Appends the element(s) for `inline` into `out`, splitting `Inline::Text`
+    /// directly without extra nested `<Text>` wrappers when fading.
+    fn push_inline(&self, inline: &Inline, key: &str, out: &mut Vec<AnyElement>) {
+        match inline {
+            Inline::Text { text: t } => {
+                let Some((base, spans)) = self.reveal_advance(t.len()) else {
+                    out.push(text(t.clone()).into_element());
+                    return;
+                };
+                let mut pos = 0usize;
+                for span in spans {
+                    let s = span.start.saturating_sub(base).min(t.len()).max(pos);
+                    let e = span.end.saturating_sub(base).min(t.len());
+                    if s > pos && t.is_char_boundary(pos) && t.is_char_boundary(s) {
+                        out.push(text(t[pos..s].to_owned()).into_element());
+                    }
+                    if e > s && t.is_char_boundary(s) && t.is_char_boundary(e) {
+                        let reveal = self.reveal.clone();
+                        let frame = reveal.frame_signal();
+                        let begin_ms = span.begin_ms;
+                        out.push(
+                            text(t[s..e].to_owned())
+                                .opacity(move || {
+                                    frame.get();
+                                    reveal.alpha(begin_ms)
+                                })
+                                .into_element(),
+                        );
+                    }
+                    pos = e.max(pos);
+                }
+                if pos < t.len() && t.is_char_boundary(pos) {
+                    out.push(text(t[pos..].to_owned()).into_element());
+                }
+            }
+            Inline::Code { code } => {
+                let fade = self.reveal_advance(code.len());
+                let el = self.part(code_span(text(code.clone())), Part::Code);
+                let el = if let Some((_, spans)) = fade {
+                    let begin_ms = spans[0].begin_ms;
+                    let reveal = self.reveal.clone();
+                    let frame = reveal.frame_signal();
+                    el.opacity(move || {
+                        frame.get();
+                        reveal.alpha(begin_ms)
+                    })
+                } else {
+                    el
+                };
+                out.push(el.into_element());
+            }
+            Inline::Keyboard { text: keys } => {
+                let fade = self.reveal_advance(keys.len());
+                let el = self.part(code_span(text(keys.clone())), Part::Keyboard);
+                let el = if let Some((_, spans)) = fade {
+                    let begin_ms = spans[0].begin_ms;
+                    let reveal = self.reveal.clone();
+                    let frame = reveal.frame_signal();
+                    el.opacity(move || {
+                        frame.get();
+                        reveal.alpha(begin_ms)
+                    })
+                } else {
+                    el
+                };
+                out.push(el.into_element());
+            }
+            other => out.push(self.inline(other, key)),
+        }
+    }
+
     /// The spans of `content`.
     fn inlines(&self, content: &[Inline], key: &str) -> Vec<AnyElement> {
-        content
-            .iter()
-            .enumerate()
-            .map(|(i, inline)| self.inline(inline, &format!("{key}.{i}")))
-            .collect()
+        let mut out = Vec::with_capacity(content.len());
+        for (i, inline) in content.iter().enumerate() {
+            self.push_inline(inline, &format!("{key}.{i}"), &mut out);
+        }
+        out
     }
 
     fn span(&self, content: &[Inline], key: &str) -> Text {
@@ -1843,45 +1995,58 @@ impl Cx {
                 self.part(el, Part::Link).into_element()
             }
             Inline::Image(image) => {
+                self.reveal_advance(image.alt.len());
                 let link = self.link.borrow().clone();
                 self.image(image, link, ImageFlow::Inline(self.line.get()), key)
             }
-            Inline::Math { tex } => match &self.render_math {
-                Some(render) => render
-                    .render(
-                        format!("math:{key}"),
-                        TextViewMath {
-                            tex: tex.clone().into(),
-                            display: false,
-                        },
-                    )
-                    .into_element(),
-                // A terminal reads the formula as text (`16.7 ms`), not
-                // its source.
-                None if is_terminal() => self
-                    .part(text(super::tex_text::tex_text(tex)), Part::Math)
-                    .into_element(),
-                // Typeset in the line, its middle on the text's; a copy
-                // of the text keeps its source in place.
-                None => match self.formula(tex, false, BODY_SIZE) {
-                    Some(formula) => self
-                        .part(
-                            view()
-                                .flex_row()
-                                .align_middle()
-                                .label(tex.clone())
-                                .copy_text(format!("${tex}$"))
-                                .child(formula),
-                            Part::Math,
+            Inline::Math { tex } => {
+                self.reveal_advance(tex.len());
+                match &self.render_math {
+                    Some(render) => render
+                        .render(
+                            format!("math:{key}"),
+                            TextViewMath {
+                                tex: tex.clone().into(),
+                                display: false,
+                            },
                         )
                         .into_element(),
-                    None => self
-                        .part(code_span(text(tex.clone())), Part::Math)
+                    // A terminal reads the formula as text (`16.7 ms`), not
+                    // its source.
+                    None if is_terminal() => self
+                        .part(text(super::tex_text::tex_text(tex)), Part::Math)
                         .into_element(),
-                },
-            },
-            Inline::Break => text("\n").into_element(),
+                    // Typeset in the line, its middle on the text's; a copy
+                    // of the text keeps its source in place.
+                    None => match self.formula(tex, false, BODY_SIZE) {
+                        Some(formula) => self
+                            .part(
+                                view()
+                                    .flex_row()
+                                    .align_middle()
+                                    .label(tex.clone())
+                                    .copy_text(format!("${tex}$"))
+                                    .child(formula),
+                                Part::Math,
+                            )
+                            .into_element(),
+                        None => self
+                            .part(code_span(text(tex.clone())), Part::Math)
+                            .into_element(),
+                    },
+                }
+            }
+            Inline::Break => {
+                self.reveal_advance(1);
+                text("\n").into_element()
+            }
             Inline::FootnoteReference { label, index } => {
+                let digits = if *index == 0 {
+                    1
+                } else {
+                    index.ilog10() as usize + 1
+                };
+                self.reveal_advance(digits + 2);
                 let scope = self.scope;
                 let url = SharedString::from(format!("#footnote-{label}"));
                 // A terminal has one text size: the number in brackets,
@@ -1906,15 +2071,25 @@ impl Cx {
                 .into_element()
             }
             Inline::Custom(node) => {
+                let advance_leaf = || {
+                    if self.reveal_cursor.borrow().is_some() {
+                        let mut tmp = String::new();
+                        super::document::inline_text(std::slice::from_ref(inline), &mut tmp);
+                        self.reveal_advance(tmp.len());
+                    }
+                };
                 if let Some(el) = self.plugins.render(node) {
+                    advance_leaf();
                     return el;
                 }
                 if let Some(render) = &self.render_custom {
+                    advance_leaf();
                     return render
                         .render(format!("custom:{key}"), node.clone())
                         .into_element();
                 }
                 let el = if node.content.is_empty() {
+                    advance_leaf();
                     text(node.text.clone())
                 } else {
                     self.span(&node.content, key)

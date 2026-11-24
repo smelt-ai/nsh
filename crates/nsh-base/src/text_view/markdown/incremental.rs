@@ -214,12 +214,12 @@ impl Incremental {
         // what it made of a shorter text is not final. A text read with
         // plugins is read from its start every time, a long one in parts.
         let grew = parser.plugins.is_empty()
-            && self.parser.as_ref().is_some_and(|p| same(p, parser))
+            && self.parser.as_ref().is_some_and(|p| same_prefix(p, parser))
             && text.starts_with(self.text.as_str());
+        self.parser = Some(parser.clone());
         let read = if grew {
             self.text.len()
         } else {
-            self.parser = Some(parser.clone());
             self.prefix = Prefix::default();
             0
         };
@@ -278,8 +278,12 @@ fn incremental(parser: &Parser) -> bool {
         && super::plugins_keep_constructs(parser)
 }
 
-fn same(a: &Parser, b: &Parser) -> bool {
-    a.options == b.options && a.extensions == b.extensions && a.plugins == b.plugins
+fn same_prefix(a: &Parser, b: &Parser) -> bool {
+    let mut ao = a.options;
+    let mut bo = b.options;
+    ao.streaming = false;
+    bo.streaming = false;
+    ao == bo && a.extensions == b.extensions && a.plugins == b.plugins
 }
 
 /// What a read of a text gives besides the blocks before the boundary.
@@ -1763,6 +1767,34 @@ mod tests {
     fn random_documents() {
         let (reads, moved, _) = random(0x9E37_79B9_7F4A_7C15, 400);
         assert!(reads > 4000 && moved > 100, "{reads} reads, {moved} moved");
+    }
+
+    #[test]
+    fn toggling_streaming_off_preserves_prefix_and_matches_full_parse() {
+        let source = concat!(
+            "# Section\n\n",
+            "First settled paragraph with **bold** and `code`.\n\n",
+            "Second settled paragraph in Chinese: 你好世界。\n\n",
+            "Tail still arriving with *emphasis"
+        );
+        let final_text = format!("{source}* and more.");
+        let mut incremental = Incremental::default();
+        let streaming = parser(true);
+        let settled = parser(false);
+
+        let mid = incremental.parse(&streaming, &shared(source));
+        assert!(incremental.boundary() > 0);
+        let prefix_count = incremental.prefix.blocks.len();
+        assert!(prefix_count >= 2);
+
+        let finished = incremental.parse(&settled, &shared(&final_text));
+        assert_eq!(finished.document(), settled.markdown(&final_text));
+        for i in 0..prefix_count {
+            assert!(
+                Rc::ptr_eq(&mid.blocks[i].0, &finished.blocks[i].0),
+                "prefix block {i} should remain shared when streaming flips off"
+            );
+        }
     }
 
     /// The same over many more documents (`cargo test --release -p nsh-base

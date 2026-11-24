@@ -266,6 +266,25 @@ impl ResolvedTextStyle {
         }
     }
 
+    /// Returns this style with its foreground, decoration and background
+    /// alphas scaled by `opacity` (`0.0..=1.0`), preserving glyph metrics
+    /// and background presence so `same_but_colors` stays true.
+    #[must_use]
+    pub(crate) fn with_opacity(self, opacity: f32) -> Self {
+        if opacity >= 1.0 || self.hidden {
+            return self;
+        }
+        Self {
+            color: self.color.with_opacity(opacity),
+            decoration_color: self.decoration_color.map(|c| c.with_opacity(opacity)),
+            background: self.background.map(|b| TextBackground {
+                color: b.color.with_opacity(opacity),
+                ..b
+            }),
+            ..self
+        }
+    }
+
     /// The line height [`ApproxTextEngine`] and offscreen estimates give
     /// this style: its explicit `line_height`, `line_height_multiple` of
     /// `font_size` (clamped to at least 1 pt), or `1.2 × font_size`.
