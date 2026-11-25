@@ -190,6 +190,25 @@ impl CpuWindow {
     }
 }
 
+/// Non-release host ops submitted by a VM before cycle collection runs when
+/// no structural tree mutation occurred.
+pub(crate) const GC_OP_THRESHOLD: u32 = 128;
+
+/// Whether an op mutates the retained node/slot structure (which can create
+/// reference cycles across detached subtrees). Excludes [`Op::Release`] because
+/// cycle collection itself emits `Op::Release` when freeing detached nodes.
+pub(crate) fn is_structural_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Create { .. }
+            | Op::CreateText { .. }
+            | Op::Insert { .. }
+            | Op::Remove { .. }
+            | Op::AttachSlot { .. }
+            | Op::DetachSlot { .. }
+    )
+}
+
 /// One live guest plugin VM running on the engine thread.
 pub(crate) struct PluginVm {
     pub(crate) id: String,
@@ -197,11 +216,31 @@ pub(crate) struct PluginVm {
     pub(crate) script: Script,
     pub(crate) posts: nsh_core::element::Posts,
     pub(crate) _host: HostAttachment,
-    pub(crate) dirty_since_gc: bool,
+    pub(crate) ops_since_gc: u32,
+    pub(crate) has_structural_churn: bool,
     cpu: CpuWindow,
 }
 
 impl PluginVm {
+    pub(crate) fn needs_gc(&self) -> bool {
+        self.has_structural_churn || self.ops_since_gc >= GC_OP_THRESHOLD
+    }
+
+    pub(crate) fn record_ops(&mut self, ops: &[Op]) {
+        let non_release = ops
+            .iter()
+            .filter(|op| !matches!(op, Op::Release { .. }))
+            .count();
+        let non_release = u32::try_from(non_release).unwrap_or(u32::MAX);
+        self.ops_since_gc = self.ops_since_gc.saturating_add(non_release);
+        self.has_structural_churn |= ops.iter().any(is_structural_op);
+    }
+
+    pub(crate) fn clear_gc_dirty(&mut self) {
+        self.ops_since_gc = 0;
+        self.has_structural_churn = false;
+    }
+
     /// Runs `f` against this guest VM and charges its elapsed time against the
     /// rolling CPU window.
     #[inline]
@@ -225,6 +264,7 @@ pub(crate) struct Plugins {
     /// Deterministic iteration order for commits, timers and broadcasts.
     order: Vec<TenantId>,
     next_tenant: TenantId,
+    gc_cursor: usize,
     /// Mirrors the engine's `content_culling` setting for newly loaded plugins.
     lazy_rows: bool,
     #[cfg(feature = "js-core")]
@@ -238,6 +278,7 @@ impl Plugins {
             by_id: FxHashMap::default(),
             order: Vec::new(),
             next_tenant: 1,
+            gc_cursor: 0,
             lazy_rows,
             #[cfg(feature = "js-core")]
             shared_ids: nsh_js::SharedIds::new(),
@@ -319,7 +360,7 @@ impl Plugins {
     }
 
     pub(crate) fn has_dirty_gc(&self) -> bool {
-        self.vms.values().any(|vm| vm.dirty_since_gc)
+        self.vms.values().any(PluginVm::needs_gc)
     }
 
     pub(crate) fn dispatch_event(
@@ -691,7 +732,7 @@ impl Plugins {
                 if ops.is_empty() {
                     continue;
                 }
-                vm.dirty_since_gc = true;
+                vm.record_ops(ops);
                 vm.posts.clone()
             };
             core.set_posts(posts);
@@ -708,15 +749,27 @@ impl Plugins {
         }
     }
 
-    /// Runs cycle collection only on guest VMs that committed ops since their
-    /// last collection (idle guest VMs stay untouched).
-    pub(crate) fn collect_dirty_gc(&mut self) {
-        for vm in self.vms.values_mut() {
-            if vm.dirty_since_gc {
+    /// Runs cycle collection on at most one dirty guest VM per turn (round-robin),
+    /// returning the collected plugin id, leaving idle and non-dirty guest VMs untouched.
+    pub(crate) fn collect_one_dirty_gc(&mut self) -> Option<String> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let len = self.order.len();
+        for offset in 0..len {
+            let idx = (self.gc_cursor + offset) % len;
+            let tenant = self.order[idx];
+            if let Some(vm) = self.vms.get_mut(&tenant)
+                && vm.needs_gc()
+            {
+                let id = vm.id.clone();
                 vm.script.collect_garbage();
-                vm.dirty_since_gc = false;
+                vm.clear_gc_dirty();
+                self.gc_cursor = (idx + 1) % len;
+                return Some(id);
             }
         }
+        None
     }
 
     /// Tears down every guest VM whose `fatal()` is set (OOM, CPU fuse trip,
@@ -772,7 +825,8 @@ impl Plugins {
             script,
             posts,
             _host: host,
-            dirty_since_gc: true,
+            ops_since_gc: 0,
+            has_structural_churn: true,
             cpu: CpuWindow::new(cpu_window_budget),
         }
     }
@@ -1422,5 +1476,124 @@ mountSlot("fill", () => (
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn is_structural_op_tracks_tree_mutations_and_ignores_release() {
+        use super::is_structural_op;
+        use nsh_core::Op;
+
+        assert!(is_structural_op(&Op::Create {
+            id: 1,
+            tag: nsh_core::Tag::View,
+        }));
+        assert!(is_structural_op(&Op::Remove {
+            parent: 1,
+            child: 2,
+        }));
+        assert!(is_structural_op(&Op::Insert {
+            parent: 1,
+            child: 2,
+            before: None,
+        }));
+        assert!(!is_structural_op(&Op::Release { id: 1 }));
+        assert!(!is_structural_op(&Op::SetText {
+            id: 1,
+            text: String::new(),
+        }));
+        assert!(!is_structural_op(&Op::SetStyle {
+            id: 1,
+            style: Box::default(),
+            patch: nsh_core::StylePatch::default(),
+        }));
+    }
+
+    #[test]
+    fn collect_one_dirty_gc_collects_at_most_one_vm_round_robin() {
+        use super::{GC_OP_THRESHOLD, Plugins, Script, TenantId, script};
+        use nsh_core::{Core, Op};
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let host = HostChannel::new();
+        let env = crate::Environment::default();
+        let displays: Arc<[nsh_core::desktop::Display]> = Arc::from(Vec::new());
+        let core = Core::new(
+            std::rc::Rc::new(DummyText),
+            Size::new(Points(400.0), Points(300.0)),
+        );
+        let mut plugins = Plugins::new(false);
+        let shared_ids = plugins.shared_ids();
+        let make_vm = |id: &str, tenant: TenantId| {
+            let bundle = bundle_tsx("");
+            let cfg = PluginConfig::new(id, bundle.clone());
+            let posts = nsh_core::element::Posts::new();
+            let attachment = host.attach_tenant(tenant, tx.clone());
+            let system = script::SystemConfig {
+                access: Default::default(),
+                websocket: None,
+                refuse_connections: None,
+                filesystem: None,
+                updater: None,
+                app_url: Default::default(),
+                data_dir: None,
+                paths: crate::bundle_system_paths(&bundle),
+                wake: Arc::new(|| {}),
+                host: std::rc::Rc::new(host.bridge_tenant(tenant, tx.clone())),
+                lazy_rows: false,
+                shared_ids: Some(shared_ids.clone()),
+                guest: true,
+                plugin_id: Some(id.to_owned()),
+            };
+            let (script, _) = Script::start(
+                &bundle,
+                cfg.limits,
+                &[],
+                posts.clone(),
+                &env,
+                &displays,
+                core.tokens().clone(),
+                core.theme_tokens(),
+                std::rc::Rc::new(DummyText),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::rc::Rc::new(DummySink::default()),
+                system,
+            )
+            .expect("script start");
+            Plugins::make_vm(id.to_owned(), tenant, script, posts, attachment, None)
+        };
+
+        plugins.insert(make_vm("vm-a", 1));
+        plugins.insert(make_vm("vm-b", 2));
+        assert!(plugins.has_dirty_gc());
+
+        assert_eq!(plugins.collect_one_dirty_gc().as_deref(), Some("vm-a"));
+        assert!(!plugins.get_mut(1).unwrap().needs_gc());
+        assert!(plugins.get_mut(2).unwrap().needs_gc());
+        assert!(plugins.has_dirty_gc());
+
+        assert_eq!(plugins.collect_one_dirty_gc().as_deref(), Some("vm-b"));
+        assert!(!plugins.get_mut(2).unwrap().needs_gc());
+        assert!(!plugins.has_dirty_gc());
+        assert_eq!(plugins.collect_one_dirty_gc(), None);
+
+        // Op::Release alone must never re-dirty a collected VM.
+        plugins
+            .get_mut(1)
+            .unwrap()
+            .record_ops(&[Op::Release { id: 1 }]);
+        assert!(!plugins.get_mut(1).unwrap().needs_gc());
+
+        // Non-structural ops accumulate up to GC_OP_THRESHOLD before dirtying.
+        let mut updates: Vec<Op> = (0..(GC_OP_THRESHOLD - 1))
+            .map(|i| Op::SetText {
+                id: i,
+                text: String::new(),
+            })
+            .collect();
+        plugins.get_mut(1).unwrap().record_ops(&updates);
+        assert!(!plugins.get_mut(1).unwrap().needs_gc());
+        updates.truncate(1);
+        plugins.get_mut(1).unwrap().record_ops(&updates);
+        assert!(plugins.get_mut(1).unwrap().needs_gc());
     }
 }

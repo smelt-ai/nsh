@@ -112,7 +112,7 @@ const PERF_STATS_INTERVAL: Duration = Duration::from_secs(1);
 /// Minimum time between idle cycle collections. QuickJS frees acyclic
 /// garbage immediately; only cycles (such as detached node subtrees, whose
 /// parent/child links reference each other) wait for the collector.
-const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
+const IDLE_GC_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long the engine has had nothing to do (no message, no timer due)
 /// before an idle collection: a collection walks every object of the VM,
@@ -120,10 +120,101 @@ const IDLE_GC_INTERVAL: Duration = Duration::from_secs(1);
 /// a pause rather than land between the turns of a paste held down or of
 /// work done in slices on timers. An engine never quiet that long (a
 /// timer every few frames) still collects every [`IDLE_GC_LONGEST`].
-const IDLE_GC_QUIET: Duration = Duration::from_millis(300);
+const IDLE_GC_QUIET: Duration = Duration::from_millis(1200);
+
+/// Delay between single-VM incremental idle collections when multiple VMs need GC.
+const IDLE_GC_STEP: Duration = Duration::from_millis(250);
 
 /// The longest time between idle collections, quiet or not.
-const IDLE_GC_LONGEST: Duration = Duration::from_secs(5);
+const IDLE_GC_LONGEST: Duration = Duration::from_secs(15);
+
+/// Maximum wall-clock time spent draining deferrable background messages in
+/// one frame before committing and yielding to new user input.
+const FRAME_BUDGET: Duration = Duration::from_millis(6);
+
+fn slow_turn_threshold() -> Option<Duration> {
+    static THRESHOLD: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("NSH_SLOW_TURN_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+fn message_label(message: &Message) -> &'static str {
+    match message {
+        Message::Event(..) => "event",
+        Message::Scroll(..) => "scroll",
+        Message::KeyScrolled(..) => "key_scrolled",
+        Message::Kept(..) => "kept",
+        Message::ContentCulling(..) => "content_culling",
+        Message::InputScroll(..) => "input_scroll",
+        Message::InputComposing(..) => "input_composing",
+        Message::Zoom(..) => "zoom",
+        Message::ComponentSize(..) => "component_size",
+        Message::AnimationsFinished(..) => "animations_finished",
+        Message::Resize(..) => "resize",
+        Message::Wake => "wake",
+        Message::Environment(..) => "environment",
+        Message::ShadersUnavailable => "shaders_unavailable",
+        Message::Displays(..) => "displays",
+        Message::RootSize(..) => "root_size",
+        Message::OverlayArea(..) => "overlay_area",
+        Message::PressBeyondRoot(..) => "press_beyond_root",
+        Message::PressOnNative(..) => "press_on_native",
+        Message::ScreenHeader(..) => "screen_header",
+        Message::Frame => "frame",
+        Message::States(..) => "states",
+        Message::ReleaseStates(..) => "release_states",
+        Message::Modality(..) => "modality",
+        Message::FontsChanged => "fonts_changed",
+        Message::Remount => "remount",
+        Message::Fetch(..) => "fetch",
+        Message::AssetRead(..) => "asset_read",
+        Message::Hot(..) => "hot",
+        Message::Chunk(..) => "chunk",
+        Message::Perf(..) => "perf",
+        Message::Tokens(..) => "tokens",
+        Message::HostFont(..) => "host_font",
+        Message::HostEvent(..) => "host_event",
+        Message::HostReply(..) => "host_reply",
+        Message::CoreHostReply(..) => "core_host_reply",
+        Message::LoadPlugin(..) => "load_plugin",
+        Message::UnloadPlugin(..) => "unload_plugin",
+        Message::PluginHostEvent(..) => "plugin_host_event",
+        Message::PluginHostReply(..) => "plugin_host_reply",
+        Message::SnapshotStats(..) => "snapshot_stats",
+        Message::UrlHandled { .. } => "url_handled",
+        Message::Advance(..) => "advance",
+        Message::Flush(..) => "flush",
+        Message::Shutdown => "shutdown",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn track_handle<M: TextEngine + 'static>(
+    driver: &mut Driver<M>,
+    message: Message,
+    rx: &Receiver<Message>,
+    measure: bool,
+    max_label: &mut &'static str,
+    max_dur: &mut Duration,
+) -> bool {
+    let label = if measure { message_label(&message) } else { "" };
+    let started = measure.then(Instant::now);
+    let keep = driver.handle(message, rx);
+    if let Some(started) = started {
+        let dur = started.elapsed();
+        if dur >= *max_dur {
+            *max_dur = dur;
+            *max_label = label;
+        }
+    }
+    keep
+}
 
 /// The shortest time between two deliveries of mouse motion: a frame at
 /// 120 Hz. Mice report moves far more often (up to 1000 Hz), and a handler
@@ -2167,6 +2258,34 @@ fn start_trial(trial: Arc<dyn Trial>) {
     drop(trial);
 }
 
+fn is_high_priority(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Event(..)
+            | Message::Scroll(..)
+            | Message::KeyScrolled(..)
+            | Message::InputScroll(..)
+            | Message::InputComposing(..)
+            | Message::Zoom(..)
+            | Message::Resize(..)
+            | Message::RootSize(..)
+            | Message::OverlayArea(..)
+            | Message::PressBeyondRoot(..)
+            | Message::PressOnNative(..)
+            | Message::Frame
+            | Message::States(..)
+            | Message::ReleaseStates(..)
+            | Message::Modality(..)
+    )
+}
+
+fn is_barrier(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Flush(..) | Message::Advance(..) | Message::SnapshotStats(..)
+    )
+}
+
 /// Runs the engine's loop until it stops.
 #[cfg(not(target_arch = "wasm32"))]
 fn drive<M: TextEngine + 'static>(
@@ -2174,35 +2293,149 @@ fn drive<M: TextEngine + 'static>(
     rx: &Receiver<Message>,
     wakeups: &std::sync::atomic::AtomicU64,
 ) {
+    let mut deferred = std::collections::VecDeque::new();
     loop {
-        let message = match driver.deadline() {
-            Some(deadline) => match rx.recv_deadline(deadline) {
+        let first = if !deferred.is_empty() {
+            match rx.try_recv() {
                 Ok(message) => Some(message),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-            },
-            None => match rx.recv() {
-                Ok(message) => Some(message),
-                Err(_) => return,
-            },
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            }
+        } else {
+            match driver.deadline() {
+                Some(deadline) => match rx.recv_deadline(deadline) {
+                    Ok(message) => Some(message),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                },
+                None => match rx.recv() {
+                    Ok(message) => Some(message),
+                    Err(_) => return,
+                },
+            }
         };
         wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let started = driver.state.perf.is_some().then(Instant::now);
-        if let Some(message) = message {
-            if !driver.handle(message, rx) {
-                return;
-            }
-            // Coalesce everything already queued into this frame.
-            while let Ok(message) = rx.try_recv() {
-                if !driver.handle(message, rx) {
+        let slow = slow_turn_threshold();
+        let turn_start = Instant::now();
+        let mut ran_high = false;
+        let mut high_count = 0usize;
+        let mut max_msg_label = "none";
+        let mut max_msg_dur = Duration::ZERO;
+
+        if let Some(first) = first {
+            let mut incoming =
+                std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()));
+            for message in &mut incoming {
+                if matches!(message, Message::Shutdown) {
+                    let _ = driver.handle(message, rx);
                     return;
+                }
+                if is_high_priority(&message) {
+                    if !track_handle(
+                        driver,
+                        message,
+                        rx,
+                        slow.is_some(),
+                        &mut max_msg_label,
+                        &mut max_msg_dur,
+                    ) {
+                        return;
+                    }
+                    ran_high = true;
+                    high_count += 1;
+                } else if is_barrier(&message) {
+                    while let Some(queued) = deferred.pop_front() {
+                        if !track_handle(
+                            driver,
+                            queued,
+                            rx,
+                            slow.is_some(),
+                            &mut max_msg_label,
+                            &mut max_msg_dur,
+                        ) {
+                            return;
+                        }
+                    }
+                    if !track_handle(
+                        driver,
+                        message,
+                        rx,
+                        slow.is_some(),
+                        &mut max_msg_label,
+                        &mut max_msg_dur,
+                    ) {
+                        return;
+                    }
+                } else {
+                    deferred.push_back(message);
                 }
             }
         }
+
+        let mut ran_deferred = 0usize;
+        while let Some(message) = deferred.pop_front() {
+            if ran_high && turn_start.elapsed() >= FRAME_BUDGET {
+                deferred.push_front(message);
+                break;
+            }
+            if !track_handle(
+                driver,
+                message,
+                rx,
+                slow.is_some(),
+                &mut max_msg_label,
+                &mut max_msg_dur,
+            ) {
+                return;
+            }
+            ran_deferred += 1;
+            if let Ok(next) = rx.try_recv() {
+                if matches!(next, Message::Shutdown) {
+                    let _ = driver.handle(next, rx);
+                    return;
+                }
+                if is_high_priority(&next) {
+                    if !track_handle(
+                        driver,
+                        next,
+                        rx,
+                        slow.is_some(),
+                        &mut max_msg_label,
+                        &mut max_msg_dur,
+                    ) {
+                        return;
+                    }
+                    high_count += 1;
+                    break;
+                } else {
+                    deferred.push_back(next);
+                }
+            }
+            if ran_deferred > 0 && turn_start.elapsed() >= FRAME_BUDGET {
+                break;
+            }
+        }
+
         driver.turn();
+        if let Some(threshold) = slow {
+            let elapsed = turn_start.elapsed();
+            if elapsed >= threshold {
+                log::warn!(
+                    target: "nsh::perf",
+                    "[nsh::slow] turn={:.1}ms high={} deferred={} remaining={} max_msg={}({:.1}ms)",
+                    elapsed.as_secs_f64() * 1000.0,
+                    high_count,
+                    ran_deferred,
+                    deferred.len(),
+                    max_msg_label,
+                    max_msg_dur.as_secs_f64() * 1000.0,
+                );
+            }
+        }
         driver.state.record_perf(started);
         driver.read_perf_stats();
-        if rx.is_empty() {
+        if rx.is_empty() && deferred.is_empty() {
             driver.collect_if_idle();
         }
     }
@@ -2449,6 +2682,7 @@ struct Driver<M: TextEngine + 'static> {
     /// once; its views stay as they were and no JS runs any more.
     stopped: bool,
     last_gc: Instant,
+    gc_in_progress: bool,
     /// When a message or a due timer last gave the engine work
     /// ([`IDLE_GC_QUIET`]).
     last_active: Instant,
@@ -2692,7 +2926,8 @@ impl<M: TextEngine + 'static> Driver<M> {
             perf: None,
             perf_stats_at: None,
             perf_commit: perf::CommitTiming::default(),
-            committed_since_gc: false,
+            shell_ops_since_gc: 0,
+            shell_structural_since_gc: false,
             hot: Vec::new(),
             scroll_events: FxHashMap::default(),
             touch_move: None,
@@ -2753,6 +2988,7 @@ impl<M: TextEngine + 'static> Driver<M> {
             plugin_env,
             stopped: false,
             last_gc: Instant::now(),
+            gc_in_progress: false,
             last_active: Instant::now(),
             posts: posts.clone(),
             clock: config.clock.clone(),
@@ -2896,7 +3132,7 @@ impl<M: TextEngine + 'static> Driver<M> {
     /// (on the system's clock; a manual one moves only when told), or the
     /// idle collection (the system's time, whatever the clock).
     fn deadline(&self) -> Option<Instant> {
-        let gc_needed = (self.script.is_some() && self.state.committed_since_gc)
+        let gc_needed = (self.script.is_some() && self.state.shell_needs_gc())
             || self.state.plugins.has_dirty_gc();
         let gc_deadline = gc_needed.then(|| self.next_gc());
         let due = if self.clock.is_manual() {
@@ -3260,44 +3496,64 @@ impl<M: TextEngine + 'static> Driver<M> {
     /// the engine has been quiet for [`IDLE_GC_QUIET`] (or at the latest
     /// [`IDLE_GC_LONGEST`] after the last).
     fn next_gc(&self) -> Instant {
+        let interval = if self.gc_in_progress {
+            IDLE_GC_STEP
+        } else {
+            IDLE_GC_INTERVAL
+        };
         let quiet = (self.last_active + IDLE_GC_QUIET).min(self.last_gc + IDLE_GC_LONGEST);
-        (self.last_gc + IDLE_GC_INTERVAL).max(quiet)
+        (self.last_gc + interval).max(quiet)
     }
 
-    /// Collects cycles when the engine has been idle long enough, so
-    /// released nodes free their views.
+    /// Collects cycles when the engine has been idle long enough, collecting at
+    /// most one VM per turn so large multi-plugin workspaces never stall input.
     fn collect_if_idle(&mut self) {
-        let shell_dirty = self.script.is_some() && self.state.committed_since_gc;
+        let shell_dirty = self.script.is_some() && self.state.shell_needs_gc();
         let plugins_dirty = self.state.plugins.has_dirty_gc();
         if (shell_dirty || plugins_dirty) && Instant::now() >= self.next_gc() {
-            let start = self.state.trace.then(Instant::now);
+            let slow = slow_turn_threshold();
+            let start = (self.state.trace || slow.is_some()).then(Instant::now);
+            let mut gc_target: Option<String> = None;
             if shell_dirty && let Some(script) = &self.script {
                 script.collect_garbage();
-            }
-            if plugins_dirty {
-                self.state.plugins.collect_dirty_gc();
-            }
-            if let Some(start) = start {
-                log::info!(target: "nsh::perf", "gc: {}µs", start.elapsed().as_micros());
-            }
-            // What the app holds, for the performance monitor: read here,
-            // when the heap was just walked and nothing waits.
-            if let Some(monitor) = &self.state.perf
-                && let Some(script) = &self.script
+                self.state.shell_ops_since_gc = 0;
+                self.state.shell_structural_since_gc = false;
+                gc_target = Some("shell".to_owned());
+                // What the app holds, for the performance monitor: read here,
+                // when the heap was just walked and nothing waits.
+                if let Some(monitor) = &self.state.perf {
+                    let (js_heap, js_objects) = script.heap_usage();
+                    monitor.set_memory(perf::MemorySample {
+                        js_heap,
+                        js_objects,
+                        nodes: self.state.core.node_count() as u64,
+                        node_ids: self.state.core.node_id_room() as u64,
+                    });
+                }
+            } else if plugins_dirty
+                && let Some(plugin_id) = self.state.plugins.collect_one_dirty_gc()
             {
-                let (js_heap, js_objects) = script.heap_usage();
-                monitor.set_memory(perf::MemorySample {
-                    js_heap,
-                    js_objects,
-                    nodes: self.state.core.node_count() as u64,
-                    node_ids: self.state.core.node_id_room() as u64,
-                });
+                gc_target = Some(format!("plugin:{plugin_id}"));
             }
-            self.last_gc = Instant::now();
-            self.state.committed_since_gc = false;
+            if let (Some(start), Some(target)) = (start, gc_target.as_deref()) {
+                let elapsed = start.elapsed();
+                if self.state.trace {
+                    log::info!(target: "nsh::perf", "gc: {}µs ({target})", elapsed.as_micros());
+                }
+                if slow.is_some_and(|threshold| elapsed >= threshold) {
+                    log::warn!(
+                        target: "nsh::perf",
+                        "[nsh::slow] gc={:.1}ms target={target}",
+                        elapsed.as_secs_f64() * 1000.0,
+                    );
+                }
+            }
             let batch = self.state.commit(self.script.as_ref());
             self.state.submit_mount(&*self.sink, batch);
             self.state.run_on_main_thread(&*self.sink);
+            self.last_gc = Instant::now();
+            self.gc_in_progress = (self.script.is_some() && self.state.shell_needs_gc())
+                || self.state.plugins.has_dirty_gc();
         }
     }
 
@@ -3370,7 +3626,8 @@ struct State<M: TextEngine> {
     /// The core's share of the wake-up being measured (`layout`, `ops`,
     /// `items`; `js` is the rest of the wake-up).
     perf_commit: perf::CommitTiming,
-    committed_since_gc: bool,
+    shell_ops_since_gc: u32,
+    shell_structural_since_gc: bool,
     /// The embedding app's channel: its URL handler sees the app's URLs
     /// first.
     host: HostChannel,
@@ -3992,6 +4249,21 @@ impl<M: TextEngine> State<M> {
         platform
     }
 
+    fn shell_needs_gc(&self) -> bool {
+        self.shell_structural_since_gc || self.shell_ops_since_gc >= plugins::GC_OP_THRESHOLD
+    }
+
+    fn record_shell_ops(&mut self) {
+        let non_release = self
+            .ops
+            .iter()
+            .filter(|op| !matches!(op, Op::Release { .. }))
+            .count();
+        let non_release = u32::try_from(non_release).unwrap_or(u32::MAX);
+        self.shell_ops_since_gc = self.shell_ops_since_gc.saturating_add(non_release);
+        self.shell_structural_since_gc |= self.ops.iter().any(plugins::is_structural_op);
+    }
+
     /// Hands the app's host calls and posts to the embedding app's channel
     /// where it is configured, else to the platform's host
     /// ([`nsh_core::Core::host_request_on_platform`]), and the host's
@@ -4019,7 +4291,6 @@ impl<M: TextEngine> State<M> {
         let mut merged: Option<MountBatch> = None;
         let mut commits = 0;
         let mut op_count = 0;
-        let mut shell_op_count = 0;
         let mut js = std::time::Duration::ZERO;
         // The overscan bound this turn ([`PACED_BIND_OPS`]).
         let mut paced = PacedBinds::default();
@@ -4114,12 +4385,11 @@ impl<M: TextEngine> State<M> {
             js += js_start.elapsed();
             // Apply shell ops first under `SHELL_TENANT`, then each guest plugin's ops.
             if !self.ops.is_empty() {
+                self.record_shell_ops();
                 self.core.set_posts(self.shell_posts.clone());
-                let applied =
+                op_count +=
                     self.plugins
                         .apply_ops(&mut self.core, &mut self.ops, SHELL_TENANT, script);
-                shell_op_count += applied;
-                op_count += applied;
             }
             op_count +=
                 self.plugins
@@ -4192,7 +4462,6 @@ impl<M: TextEngine> State<M> {
         {
             keep_last_sets(&mut batch.items, &mut self.sets_seen);
         }
-        self.committed_since_gc |= shell_op_count > 0;
         if self.perf.is_some() && (op_count > 0 || merged.is_some()) {
             let c = &mut self.perf_commit;
             c.layout += start.elapsed().saturating_sub(js);
@@ -5140,6 +5409,24 @@ mod tests {
             })
             .collect();
         assert_eq!(frames, [50.0, 20.0]);
+    }
+
+    #[test]
+    fn message_classification_prioritizes_input_and_preserves_barriers() {
+        use super::{EventKind, EventPayload, Message, is_barrier, is_high_priority};
+
+        let input = Message::Event(1, EventKind::Press, EventPayload::None);
+        let deferred = Message::PluginHostEvent(1, "tick".into(), nsh_core::JsonValue::Null);
+        let barrier = Message::Flush(Box::new(|_, _| {}));
+
+        assert!(is_high_priority(&input));
+        assert!(!is_barrier(&input));
+
+        assert!(!is_high_priority(&deferred));
+        assert!(!is_barrier(&deferred));
+
+        assert!(!is_high_priority(&barrier));
+        assert!(is_barrier(&barrier));
     }
 }
 
