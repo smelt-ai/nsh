@@ -3114,6 +3114,35 @@ const report = (v) => text(String(v));
     }
 
     #[test]
+    fn running_out_of_memory_says_where() {
+        let mut host = sandboxed(Limits {
+            memory_bytes: 16 << 20,
+            ..Limits::default()
+        });
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let seen = errors.clone();
+        host.set_error_handler(Box::new(move |e| seen.borrow_mut().push(e.message.clone())));
+        host.eval_source(
+            r#"const keep = [];
+            function grow() {
+                for (;;) keep.push({ n: keep.length });
+            }
+            setTimeout(function tick() { grow(); }, 0);"#,
+        )
+        .unwrap();
+        host.run_timers(Instant::now() + Duration::from_millis(1));
+        let errors = errors.borrow().clone();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        // The stack of where it ran out, past the heap's limit.
+        assert!(
+            errors[0].contains("at grow") && errors[0].contains("at tick"),
+            "{}",
+            errors[0]
+        );
+        assert!(host.fatal().is_some());
+    }
+
+    #[test]
     fn running_out_of_memory_in_a_timer_stops_the_vm() {
         let mut host = sandboxed(Limits {
             memory_bytes: 16 << 20,

@@ -65,9 +65,21 @@ impl HeapAllocator {
         (allocator, exhausted)
     }
 
-    /// Whether `size` more bytes fit; records a refusal.
+    /// Whether `size` more bytes fit; records a refusal. Once one was
+    /// refused, the heap has a little more ([`reserve`]): the VM is about to
+    /// be stopped, and QuickJS can make its error, with the stack of where
+    /// the heap ran out, instead of leaving a bare `null`.
     fn fits(&self, size: usize) -> bool {
-        let fits = self.limit == 0 || self.used.saturating_add(size) <= self.limit;
+        if self.limit == 0 {
+            return true;
+        }
+        let exhausted = self.exhausted.load(Ordering::Relaxed);
+        let limit = if exhausted {
+            self.limit.saturating_add(reserve(self.limit))
+        } else {
+            self.limit
+        };
+        let fits = self.used.saturating_add(size) <= limit;
         if !fits {
             self.exhausted.store(true, Ordering::Relaxed);
         }
@@ -82,6 +94,12 @@ impl HeapAllocator {
         }
         ptr
     }
+}
+
+/// What a heap of `limit` bytes has past it once it ran out: enough for the
+/// error and its stack (1/32 of it, at most 8 MB).
+fn reserve(limit: usize) -> usize {
+    (limit / 32).min(8 << 20)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
