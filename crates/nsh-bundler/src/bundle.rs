@@ -67,6 +67,23 @@ pub struct BundleError {
     pub colored: String,
     /// Plain text, for on-device error screens.
     pub plain: String,
+    /// Each problem on one line, without its code frame, for a host to
+    /// summarize (the full report is `plain`). Never empty.
+    pub problems: Vec<BundleProblem>,
+}
+
+/// One problem of a failed build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BundleProblem {
+    /// Rolldown's code (`MISSING_EXPORT`, `UNRESOLVED_IMPORT`, …); empty for
+    /// one of nsh's own compile step (a syntax or type error).
+    pub kind: String,
+    /// What went wrong, on one line.
+    pub message: String,
+    /// For a missing export: the module it was asked of (an absolute path)
+    /// and the name asked for.
+    pub missing_export: Option<(PathBuf, String)>,
 }
 
 impl std::fmt::Display for BundleError {
@@ -86,20 +103,70 @@ impl BundleError {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let problems = diagnostics
+            .iter()
+            .map(|d| {
+                let message = strip_ansi(&d.to_string());
+                let missing_export =
+                    matches!(d.kind(), rolldown_error::EventKind::MissingExportError)
+                        .then(|| Some((PathBuf::from(d.exporter()?), quoted_name(&message)?)))
+                        .flatten();
+                BundleProblem {
+                    kind: d.kind().to_string(),
+                    message: first_line(&message),
+                    missing_export,
+                }
+            })
+            .collect();
         Self {
             colored: render(true),
             // Plugin messages may carry their own escape codes.
             plain: strip_ansi(&render(false)),
+            problems,
+        }
+    }
+
+    fn refused(refusal: plugin::Refusal) -> Self {
+        Self {
+            colored: refusal.report.clone(),
+            plain: strip_ansi(&refusal.report),
+            problems: vec![BundleProblem {
+                kind: String::new(),
+                message: strip_ansi(&refusal.summary),
+                missing_export: None,
+            }],
         }
     }
 
     fn other(err: impl std::fmt::Display) -> Self {
         let message = err.to_string();
+        let plain = strip_ansi(&message);
         Self {
-            colored: message.clone(),
-            plain: message,
+            problems: vec![BundleProblem {
+                kind: String::new(),
+                message: first_line(&plain),
+                missing_export: None,
+            }],
+            colored: message,
+            plain,
         }
     }
+}
+
+/// The first line that says something.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The name a missing-export message is about: rolldown writes it first, in
+/// quotes (`"Foo" is not exported by "a.ts", imported by "b.ts".`).
+fn quoted_name(message: &str) -> Option<String> {
+    let rest = message.strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_owned())
 }
 
 /// A bundled app.
@@ -700,7 +767,7 @@ pub async fn bundle_async(options: &BundleOptions) -> Result<Bundle, BundleError
         // Prefer our own compile error (clean code frame) over rolldown's
         // wrapped report of it.
         match plugin_error.lock().expect("error lock").take() {
-            Some(message) => BundleError::other(message),
+            Some(refusal) => BundleError::refused(refusal),
             None => BundleError::new(e.into_vec()),
         }
     })?;
@@ -1098,7 +1165,7 @@ pub async fn bundle_hot_async(
     .map_err(|e| BundleError::new(e.into_vec()))?;
     let output = bundler.generate().await.map_err(|e| {
         match plugin_error.lock().expect("error lock").take() {
-            Some(message) => BundleError::other(message),
+            Some(refusal) => BundleError::refused(refusal),
             None => BundleError::new(e.into_vec()),
         }
     })?;
@@ -1177,6 +1244,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_failed_build_lists_its_problems_one_line_each() {
+        let dir = std::env::temp_dir().join(format!("nsh-problems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Text } from \"nsh\";\n\
+             import { gone, kept } from \"./lib\";\n\
+             mount(() => <Text>{gone}{kept}</Text>);\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("lib.ts"), "export const kept = 1;\n").unwrap();
+        let error = bundle(&BundleOptions {
+            entry: dir.join("App.tsx"),
+            ..Default::default()
+        })
+        .unwrap_err();
+        let [problem] = error.problems.as_slice() else {
+            panic!("{:?}", error.problems);
+        };
+        assert_eq!(problem.kind, "MISSING_EXPORT");
+        assert!(!problem.message.contains('\n'), "{}", problem.message);
+        let (exporter, name) = problem.missing_export.clone().unwrap();
+        assert_eq!(name, "gone");
+        assert_eq!(
+            exporter.canonicalize().unwrap(),
+            dir.join("lib.ts").canonicalize().unwrap()
+        );
+        assert!(error.plain.contains("Missing export"), "{}", error.plain);
+
+        // nsh's own compile step: the file and the message, no code frame.
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Nope } from \"nsh\";\nmount(Nope);\n",
+        )
+        .unwrap();
+        let error = bundle(&BundleOptions {
+            entry: dir.join("App.tsx"),
+            ..Default::default()
+        })
+        .unwrap_err();
+        let [problem] = error.problems.as_slice() else {
+            panic!("{:?}", error.problems);
+        };
+        assert_eq!(problem.kind, "");
+        assert_eq!(problem.message, "App.tsx: `nsh` has no export `Nope`");
+        assert!(error.plain.contains("mount(Nope)"), "{}", error.plain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// An app whose screens are imported on demand: the first imports what
     /// only the screens share, the second is also imported by the first.

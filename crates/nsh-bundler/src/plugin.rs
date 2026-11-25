@@ -18,7 +18,16 @@ use rolldown::{
     },
 };
 
-use crate::compile::{NativeModules, compile_native};
+use crate::compile::{CompileError, NativeModules, compile_native};
+
+/// The build's first error.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    /// Shown as it is (with a code frame when there is one).
+    pub(crate) report: String,
+    /// Its gist, on one line.
+    pub(crate) summary: String,
+}
 
 /// Compiles the app's modules with nsh's JSX compiler against the native
 /// modules (kept as imports) and loads its assets.
@@ -29,9 +38,9 @@ pub(crate) struct NshPlugin {
     /// What `asset:/` URLs and the bundle's assets are named relative to:
     /// the app's directory (`Bundle::asset_root`), canonical.
     pub(crate) asset_root: PathBuf,
-    /// The first compile error, already formatted. Rolldown wraps plugin
-    /// errors in its own report; the bundler shows this one instead.
-    pub(crate) error: Arc<Mutex<Option<String>>>,
+    /// The first compile error. Rolldown wraps plugin errors in its own
+    /// report; the bundler shows this one instead.
+    pub(crate) error: Arc<Mutex<Option<Refusal>>>,
     /// Asset files imported by the app (absolute paths).
     pub(crate) assets: Arc<Mutex<Vec<PathBuf>>>,
     /// Development bundle with hot module replacement: components and
@@ -375,13 +384,22 @@ impl NshPlugin {
         }
     }
 
-    /// Records `message` as the build's error (shown as it is).
+    /// Records `message` (one line) as the build's error.
     fn refuse(&self, message: String) -> anyhow::Error {
+        self.record(message.clone(), message)
+    }
+
+    /// Records the build's error unless one is already: `report` shown as
+    /// it is, `summary` its gist on one line.
+    fn record(&self, report: String, summary: String) -> anyhow::Error {
         self.error
             .lock()
             .expect("error lock")
-            .get_or_insert_with(|| message.clone());
-        anyhow!(message)
+            .get_or_insert_with(|| Refusal {
+                report: report.clone(),
+                summary,
+            });
+        anyhow!(report)
     }
 
     /// `path` relative to the entry's directory with `/` separators, as
@@ -453,13 +471,19 @@ impl NshPlugin {
         })
     }
 
+    /// `path` cannot be read (`detail`, one line).
     fn fail(&self, path: &Path, detail: &str) -> anyhow::Error {
-        let message = format!("{}\n{detail}", self.rel(path));
-        self.error
-            .lock()
-            .expect("error lock")
-            .get_or_insert_with(|| message.clone());
-        anyhow!(message)
+        let rel = self.rel(path);
+        self.record(format!("{rel}\n{detail}"), format!("{rel}: {detail}"))
+    }
+
+    /// `path` does not compile.
+    fn fail_compile(&self, path: &Path, error: CompileError) -> anyhow::Error {
+        let rel = self.rel(path);
+        self.record(
+            format!("{rel}\n{}", error.report),
+            format!("{rel}: {}", error.message),
+        )
     }
 }
 
@@ -733,7 +757,7 @@ impl Plugin for NshPlugin {
             Some(&self.rel(path)),
             &self.modules,
         )
-        .map_err(|detail| self.fail(path, &detail))?;
+        .map_err(|error| self.fail_compile(path, error))?;
         if !compiled.destructured.is_empty() {
             let rel = self.rel(path);
             for d in &compiled.destructured {

@@ -101,6 +101,24 @@ pub(crate) struct Compiled {
 /// components are hot ([`crate::hot`]); with `meta_path` (the module's
 /// path in the app) its `import.meta.url` is its own. Errors are rendered
 /// with a code frame.
+/// A module that does not compile.
+#[derive(Debug)]
+pub(crate) struct CompileError {
+    /// What is wrong, on one line.
+    pub(crate) message: String,
+    /// The message with its code frame.
+    pub(crate) report: String,
+}
+
+impl CompileError {
+    pub(crate) fn new(error: oxc::diagnostics::OxcDiagnostic, source: &str) -> Self {
+        Self {
+            message: error.to_string(),
+            report: error.render_with_source_code(source.to_owned()),
+        }
+    }
+}
+
 pub(crate) fn compile_native(
     path: &Path,
     source_type: SourceType,
@@ -109,11 +127,11 @@ pub(crate) fn compile_native(
     hot_key: Option<&str>,
     meta_path: Option<&str>,
     modules: &NativeModules,
-) -> Result<Compiled, String> {
+) -> Result<Compiled, CompileError> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if let Some(err) = parsed.diagnostics.into_iter().next() {
-        return Err(err.render_with_source_code(source.to_owned()));
+        return Err(CompileError::new(err, source));
     }
     let mut program = parsed.program;
     let destructured = crate::props::check(&program, source);
@@ -137,7 +155,7 @@ pub(crate) fn compile_native(
     let ret =
         Transformer::new(&allocator, path, &options).build_with_scoping(scoping, &mut program);
     if let Some(err) = ret.diagnostics.into_iter().next() {
-        return Err(err.render_with_source_code(source.to_owned()));
+        return Err(CompileError::new(err, source));
     }
     if let Some(key) = hot_key {
         // Before the JSX goes: components are the functions with JSX.
@@ -158,7 +176,7 @@ pub(crate) fn compile_native(
         .semantic
         .into_scoping();
     if let Some(err) = check_named_imports(&program, &scoping, modules) {
-        return Err(err.render_with_source_code(source.to_owned()));
+        return Err(CompileError::new(err, source));
     }
     // Plain JS keeps imports that may be present for their side effects.
     if source_type.is_typescript() || source_type.is_jsx() {

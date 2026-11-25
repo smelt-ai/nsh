@@ -165,7 +165,7 @@ pub(crate) fn transform<'a>(
     prologue: Option<&str>,
     meta_path: Option<&str>,
     modules: &crate::compile::NativeModules,
-) -> Result<(), String> {
+) -> Result<(), crate::compile::CompileError> {
     let mut compiler = Compiler {
         meta_path,
         allocator,
@@ -179,7 +179,7 @@ pub(crate) fn transform<'a>(
     };
     compiler.visit_program(program);
     if let Some(err) = compiler.errors.into_iter().next() {
-        return Err(err.render_with_source_code(source.to_owned()));
+        return Err(crate::compile::CompileError::new(err, source));
     }
     let mut head = String::new();
     if let Some(prologue) = prologue {
@@ -202,7 +202,11 @@ pub(crate) fn transform<'a>(
     let text = allocator.alloc_str(&text);
     let parsed = Parser::new(allocator, text, SourceType::mjs()).parse();
     if let Some(err) = parsed.diagnostics.into_iter().next() {
-        return Err(format!("nsh compiler: {err}"));
+        let message = format!("nsh compiler: {err}");
+        return Err(crate::compile::CompileError {
+            report: message.clone(),
+            message,
+        });
     }
     let mut body = parsed.program.body;
     let mut splice = Splice {
@@ -1420,6 +1424,7 @@ mod tests {
             &crate::compile::NativeModules::new(&[nsh_base::registry().into()]),
         )
         .map(|c| c.code)
+        .map_err(|e| e.report)
     }
 
     /// A compile error's message on one line (the report wraps it).

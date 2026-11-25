@@ -56,7 +56,7 @@ pub fn compile_module(
     let modules = compile::NativeModules::new(ui_sets);
     let compiled =
         compile::compile_native(path, source_type, source, None, None, Some(name), &modules)
-            .map_err(|e| compile::strip_ansi(&e))?;
+            .map_err(|e| compile::strip_ansi(&e.report))?;
     for d in &compiled.destructured {
         log::warn!(target: "nsh::build", "{name}:{}:{}: {}", d.line, d.column, d.message());
     }
