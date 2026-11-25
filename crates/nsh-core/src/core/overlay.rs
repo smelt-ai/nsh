@@ -34,7 +34,11 @@
 //! in the view, shows it at once ([`Core::hint_skips_delay`],
 //! `gpui-base`'s `TooltipDefaults` grace period, Radix's
 //! `skipDelayDuration`); a press on an anchor or Escape ends the period,
-//! and the focus starts none. In every idiom the focus the keyboard moved
+//! and the focus starts none. The pointer shows one hint at a time, the
+//! innermost one's under it, as GPUI's, macOS's and Radix's tooltips do: on
+//! an anchor inside another, the outer hint hides (or waits) while the
+//! pointer is on the inner one, and shows again at once when the pointer
+//! leaves the inner one for the outer ([`Core::hint_for_pointer`]). In every idiom the focus the keyboard moved
 //! shows it too, as WAI-ARIA's tooltips: the focus that Tab, an arrow, a
 //! shortcut or the app's `focus()` after a key brought to its anchor (or
 //! into it, outside an overlay, the nearest hint's) shows it at once until
@@ -125,6 +129,10 @@ pub(super) struct OverlayState {
     /// A hint: the pointer rested on its anchor, and has not left or
     /// pressed it since.
     pub(super) hinted: bool,
+    /// A hint: the pointer is on its anchor (came and has not left), shown
+    /// or not: an anchor inside it the pointer is on keeps it hidden, and
+    /// it shows again once the pointer leaves that one for it.
+    pub(super) hovered: bool,
     /// A hint: the pointer is on its anchor, resting until it shows.
     pub(super) waiting: Option<HintTimer>,
     /// A hint: the focus is on its anchor, whatever brought it there.
@@ -215,6 +223,7 @@ impl<M: TextEngine> Core<M> {
                 native_anchor: None,
                 tab_after: None,
                 hinted: false,
+                hovered: false,
                 waiting: None,
                 focus_on: false,
                 focus_shown: false,
@@ -490,6 +499,9 @@ impl<M: TextEngine> Core<M> {
                     hints.push(key);
                 } else {
                     // Out of the view: the pointer starts again.
+                    if let Some(state) = self.overlay_mut(key) {
+                        state.hovered = false;
+                    }
                     self.unhint(key);
                 }
                 let state = self.overlay(key).expect("overlay");
@@ -821,9 +833,10 @@ impl<M: TextEngine> Core<M> {
         for key in hints {
             match kind {
                 EventKind::MouseEnter => {
-                    if span && let Some(state) = self.overlay_mut(key) {
+                    if let Some(state) = self.overlay_mut(key) {
+                        state.hovered = true;
                         // Where it goes, unless it shows already.
-                        if !state.hint_shown() {
+                        if span && !state.hint_shown() {
                             state.pointer = at;
                         }
                     }
@@ -839,10 +852,57 @@ impl<M: TextEngine> Core<M> {
                     {
                         self.overlay_state.grace_from = Some(crate::time::now());
                     }
-                    self.unhint(key)
+                    if let Some(state) = self.overlay_mut(key) {
+                        state.hovered = false;
+                    }
+                    self.unhint(key);
+                    self.rehint_outer(key);
                 }
             }
         }
+    }
+
+    /// The pointer left hint `key`'s anchor: the hints of the anchors around
+    /// it that it is still on wait again (at once within the grace period
+    /// `key` started), the innermost one showing.
+    fn rehint_outer(&mut self, key: Key) {
+        let Some(anchor) = self.hint_anchor(key) else {
+            return;
+        };
+        let outer: Vec<Key> = self
+            .overlays
+            .iter()
+            .copied()
+            .filter(|&k| {
+                k != key
+                    && self
+                        .overlay(k)
+                        .is_some_and(|s| s.config.hint.is_some() && s.hovered)
+                    && self
+                        .hint_anchor(k)
+                        .is_some_and(|a| a != anchor && self.is_within(anchor, a))
+            })
+            .collect();
+        for k in outer {
+            self.hint_wait(k);
+        }
+    }
+
+    /// Whether the pointer is on an anchor inside hint `key`'s (not its
+    /// own) whose hint it would show: that one shows, not `key`.
+    fn hint_covered(&self, key: Key) -> bool {
+        let Some(anchor) = self.hint_anchor(key) else {
+            return false;
+        };
+        self.overlays.iter().any(|&k| {
+            k != key
+                && self
+                    .overlay(k)
+                    .is_some_and(|s| s.config.hint.is_some() && s.hovered)
+                && self
+                    .hint_anchor(k)
+                    .is_some_and(|a| a != anchor && self.is_within(a, anchor))
+        })
     }
 
     /// The pointer is on hint `key`'s anchor: it shows once the pointer
@@ -909,8 +969,15 @@ impl<M: TextEngine> Core<M> {
     }
 
     /// The pointer shows hint `key` (in the commit): it asks to show unless
-    /// the focus showed it already.
+    /// the focus showed it already. One at a time: not while the pointer is
+    /// on an anchor inside `key`'s ([`Self::hint_covered`]), and the hints
+    /// the pointer showed on the anchors around `key`'s hide (it is still
+    /// on them: they show again when it leaves `key`'s,
+    /// [`Self::rehint_outer`]).
     fn hint_for_pointer(&mut self, key: Key) {
+        if self.hint_covered(key) {
+            return;
+        }
         let Some(state) = self.overlay_mut(key) else {
             return;
         };
@@ -918,6 +985,26 @@ impl<M: TextEngine> Core<M> {
         state.hinted = true;
         if !was {
             self.hint_changed(key, true, HintReason::Pointer);
+        }
+        let Some(anchor) = self.hint_anchor(key) else {
+            return;
+        };
+        let outer: Vec<Key> = self
+            .overlays
+            .iter()
+            .copied()
+            .filter(|&k| {
+                k != key
+                    && self.overlay(k).is_some_and(|s| {
+                        s.config.hint.is_some() && (s.hinted || s.waiting.is_some())
+                    })
+                    && self
+                        .hint_anchor(k)
+                        .is_some_and(|a| a != anchor && self.is_within(anchor, a))
+            })
+            .collect();
+        for k in outer {
+            self.unhint(k);
         }
     }
 
@@ -953,6 +1040,7 @@ impl<M: TextEngine> Core<M> {
         for key in hints {
             if let Some(state) = self.overlay_mut(key) {
                 state.pointer = None;
+                state.hovered = false;
             }
             self.unhint(key);
         }

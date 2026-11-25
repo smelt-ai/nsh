@@ -36601,6 +36601,66 @@ fn a_tooltip_shows_at_once_after_the_pointer_left_one_it_showed() {
         tooltip_shown(&c, inner),
         "while one the pointer showed is up"
     );
+    assert!(!tooltip_shown(&c, 2), "one at a time: the inner one");
+}
+
+#[test]
+fn the_pointer_shows_the_innermost_tooltip_only() {
+    let clock = crate::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+    let _clock = clock.enter();
+    let mut c = toolbar_core(&[2]);
+    let inner = 20;
+    add(
+        &mut c,
+        inner,
+        Tag::View,
+        2,
+        &[("height", StyleValue::Number(10.0))],
+    );
+    give_tooltip(&mut c, 2, 4, "Row");
+    give_tooltip(&mut c, inner, 22, "Avatar");
+    c.commit();
+    let mouse = EventPayload::Mouse(crate::MouseEvent::default());
+    let wait = |c: &mut Core<FakeEngine>, ms: u64| {
+        clock.advance_to(crate::time::now() + std::time::Duration::from_millis(ms));
+        c.run_component_tasks();
+        c.commit();
+    };
+    // Straight onto the inner anchor: both wait, only the inner one shows.
+    c.component_event(2, EventKind::MouseEnter, &mouse);
+    c.component_event(inner, EventKind::MouseEnter, &mouse);
+    wait(&mut c, 500);
+    assert!(tooltip_shown(&c, inner));
+    assert!(!tooltip_shown(&c, 2), "covered by the inner one");
+    // Back onto the outer anchor (still on it): its tooltip shows at once.
+    c.component_event(inner, EventKind::MouseLeave, &mouse);
+    c.commit();
+    assert!(!tooltip_shown(&c, inner));
+    assert!(tooltip_shown(&c, 2), "the pointer is still on it");
+    // Onto the inner one again: it shows at once, the outer one hides.
+    c.component_event(inner, EventKind::MouseEnter, &mouse);
+    c.commit();
+    assert!(tooltip_shown(&c, inner));
+    assert!(!tooltip_shown(&c, 2));
+    // Off both: none.
+    c.component_event(inner, EventKind::MouseLeave, &mouse);
+    c.component_event(2, EventKind::MouseLeave, &mouse);
+    c.commit();
+    assert!(!tooltip_shown(&c, inner));
+    assert!(!tooltip_shown(&c, 2));
+    // Onto the inner one before the outer one's delay is over, then back
+    // off it before its own: the outer one waits its delay from there.
+    wait(&mut c, 300);
+    c.component_event(2, EventKind::MouseEnter, &mouse);
+    wait(&mut c, 200);
+    c.component_event(inner, EventKind::MouseEnter, &mouse);
+    wait(&mut c, 300);
+    assert!(!tooltip_shown(&c, 2), "covered when its delay ended");
+    assert!(!tooltip_shown(&c, inner));
+    c.component_event(inner, EventKind::MouseLeave, &mouse);
+    wait(&mut c, 499);
+    assert!(!tooltip_shown(&c, 2));
+    wait(&mut c, 1);
     assert!(tooltip_shown(&c, 2));
 }
 
