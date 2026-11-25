@@ -1189,18 +1189,24 @@ pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
 
 /// The texture to draw `picture` with `look`: the variant if it is made,
 /// else the closest one that is (asking a worker for it, which redraws
-/// `surface` when done); `None` when nothing fitting is ready. `blur_px`
-/// is the stack blur radius at the variant's size.
-fn texture_for(picture: &Picture, look: Look, blur_px: u8, surface: u64) -> Option<Rc<Texture>> {
+/// `surface` when done), along with whether the returned texture is an exact
+/// match (`false` when standing in with a fallback); `None` when nothing fitting
+/// is ready. `blur_px` is the stack blur radius at the variant's size.
+fn texture_for(
+    picture: &Picture,
+    look: Look,
+    blur_px: u8,
+    surface: u64,
+) -> Option<(Rc<Texture>, bool)> {
     if look == Look::default() {
-        return Some(picture.texture.clone());
+        return Some((picture.texture.clone(), true));
     }
     let now = monotonic();
     let mut variants = picture.variants.borrow_mut();
     if let Some(v) = variants.iter().find(|v| v.look == look) {
         v.used.set(now);
         if let Some(t) = &v.texture {
-            return Some(t.clone());
+            return Some((t.clone(), true));
         }
     } else {
         // Fading only needs the opaque variant faded: cheaper than all of
@@ -1257,7 +1263,7 @@ fn texture_for(picture: &Picture, look: Look, blur_px: u8, surface: u64) -> Opti
     // are not huge (a texture that large is worth waiting for).
     let (w, h) = picture.pixels;
     let pixels = (!look.recolors() && w.max(h) <= 2048).then(|| &picture.texture);
-    closest(&variants, pixels, look, now)
+    closest(&variants, pixels, look, now).map(|t| (t, false))
 }
 
 /// The ready texture closest to `look`: a variant of the same colors (or
@@ -1376,6 +1382,31 @@ pub(crate) struct ImageState {
     owner: (u64, NodeId),
     /// The placeholder and the image as last drawn turned.
     turned: RefCell<[turn::Turned; 2]>,
+    /// True if the last paint fell back to a stand-in texture while an exact
+    /// variant was still building on a worker.
+    pending_variant: Cell<bool>,
+    /// Last painted placeholder and main textures kept alive on the view so
+    /// cached layer captures never outlive their sprite atlas entries.
+    last_textures: RefCell<[Option<Rc<Texture>>; 2]>,
+}
+
+impl ImageState {
+    /// True when this image is static and settled (no animated playback,
+    /// fade-in, deferred/in-flight decode, or pending variant).
+    pub(crate) fn is_cacheable(&self) -> bool {
+        self.playback.is_none()
+            && self.fade.is_none()
+            && self.load.is_none()
+            && self.placeholder_load.is_none()
+            && !self.deferred
+            && !self.pending_variant.get()
+    }
+
+    #[cfg(all(test, feature = "shot"))]
+    pub(crate) fn last_textures_present(&self) -> [bool; 2] {
+        let tex = self.last_textures.borrow();
+        [tex[0].is_some(), tex[1].is_some()]
+    }
 }
 
 /// Where an animation is in its timeline: pure bookkeeping, in monotonic
@@ -1593,11 +1624,14 @@ pub(crate) fn set(
             image.load = None;
             image.fade = None;
             image.playback = None;
+            image.pending_variant.set(false);
+            image.last_textures.borrow_mut()[1] = None;
         }
         if !same_placeholder {
             image.placeholder = None;
             image.placeholder_lease = Lease::none();
             image.placeholder_load = None;
+            image.last_textures.borrow_mut()[0] = None;
         }
     }
     view.changed();
@@ -1629,6 +1663,7 @@ pub(crate) fn set(
             i.generation == generation
         });
         if current {
+            view.bump_revision();
             start(&surface, &view);
         }
     });
@@ -1986,6 +2021,7 @@ fn level(pixels: (u32, u32), drawn: (f32, f32), blur: f32) -> (u8, u8) {
 #[allow(clippy::too_many_arguments)]
 fn draw_one(
     cx: &mut DrawCx<'_>,
+    view: &NshView,
     state: &ViewState,
     image: &ImageState,
     slot: usize,
@@ -2048,7 +2084,7 @@ fn draw_one(
             ..Look::default()
         };
         let frame = frame.min(picture.texture.frames().saturating_sub(1));
-        if let Some(mask) = texture_for(picture, plain, 0, image.owner.0)
+        if let Some((mask, exact)) = texture_for(picture, plain, 0, image.owner.0)
             && turn::draw_mask(
                 cx,
                 turned,
@@ -2060,12 +2096,22 @@ fn draw_one(
                 fade,
             )
         {
+            if image.pending_variant.replace(!exact) != !exact {
+                view.clear_cache_info();
+            }
             return;
         }
     }
-    let Some(texture) = texture_for(picture, look, blur_px, image.owner.0) else {
+    let Some((texture, exact)) = texture_for(picture, look, blur_px, image.owner.0) else {
+        if !image.pending_variant.replace(true) {
+            view.clear_cache_info();
+        }
         return;
     };
+    if image.pending_variant.replace(!exact) != !exact {
+        view.clear_cache_info();
+    }
+    image.last_textures.borrow_mut()[slot] = Some(texture.clone());
     // Its atlas copy counts in its entry once drawn.
     if Rc::ptr_eq(&texture, &picture.texture) && !picture.drawn.replace(true) {
         picture.count(picture.bytes() as isize);
@@ -2091,7 +2137,7 @@ fn draw_one(
 }
 
 /// Draws an image view's picture.
-pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
+pub(crate) fn draw(cx: &mut DrawCx<'_>, view: &NshView, state: &ViewState) {
     let Some(image) = &state.image else { return };
     release_textures(cx);
     let fading = image.fade.is_some();
@@ -2099,7 +2145,9 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
         && (image.image.is_none() || fading)
     {
         let source = image.options.placeholder.as_ref();
-        draw_one(cx, state, image, 0, placeholder, 0, source, 1.0);
+        draw_one(cx, view, state, image, 0, placeholder, 0, source, 1.0);
+    } else if image.last_textures.borrow()[0].is_some() {
+        image.last_textures.borrow_mut()[0] = None;
     }
     let Some(picture) = &image.image else { return };
     let frame = match &image.playback {
@@ -2117,7 +2165,7 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
     };
     let alpha = if fading { image.alpha } else { 1.0 };
     let source = image.source.as_ref();
-    draw_one(cx, state, image, 1, picture, frame, source, alpha);
+    draw_one(cx, view, state, image, 1, picture, frame, source, alpha);
 }
 
 #[cfg(test)]
@@ -2570,5 +2618,72 @@ mod tests {
         assert_eq!(left, [2, 4, 5, 6]);
         // Their textures wait to leave the atlases.
         assert_eq!(DROPPED.with(|d| d.borrow().len()), 2);
+    }
+
+    #[test]
+    fn texture_for_reports_exact_vs_stand_in() {
+        let make_tex = || Rc::new(Texture(Arc::new(RenderImage::new(Vec::new()))));
+        let own = make_tex();
+        let exact_tex = make_tex();
+        let near_tex = make_tex();
+        let exact_look = Look {
+            alpha: 8,
+            mip: 0,
+            ..Look::default()
+        };
+        let near_look = Look {
+            alpha: 9,
+            mip: 0,
+            ..Look::default()
+        };
+        let picture = Rc::new(Image {
+            texture: own.clone(),
+            pixels: (16, 16),
+            natural: Natural::Pixels(16, 16),
+            delays: Arc::from([]),
+            plays: 0,
+            variants: RefCell::new(vec![
+                Variant {
+                    look: near_look,
+                    texture: Some(near_tex.clone()),
+                    used: Cell::new(0),
+                },
+                Variant {
+                    look: exact_look,
+                    texture: None,
+                    used: Cell::new(0),
+                },
+            ]),
+            key: Key {
+                source: "test-exact-vs-stand-in".into(),
+                longest: 0,
+                frames: Frames::All,
+            },
+            drawn: Cell::new(false),
+            one_color: Default::default(),
+        });
+
+        let (default_tex, is_exact) = texture_for(&picture, Look::default(), 0, 1).unwrap();
+        assert!(is_exact);
+        assert!(Rc::ptr_eq(&default_tex, &own));
+
+        let (stand_in, is_exact) = texture_for(&picture, exact_look, 0, 1).unwrap();
+        assert!(!is_exact);
+        assert!(Rc::ptr_eq(&stand_in, &near_tex));
+
+        {
+            let mut variants = picture.variants.borrow_mut();
+            variants
+                .iter_mut()
+                .find(|v| v.look == exact_look)
+                .unwrap()
+                .texture = Some(exact_tex.clone());
+        }
+        let (matched, is_exact) = texture_for(&picture, exact_look, 0, 1).unwrap();
+        assert!(is_exact);
+        assert!(Rc::ptr_eq(&matched, &exact_tex));
+
+        picture.variants.borrow_mut().clear();
+        DROPPED.with(|d| d.borrow_mut().clear());
     }
 }

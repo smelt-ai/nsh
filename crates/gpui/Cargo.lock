@@ -3329,8 +3329,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5e62370ab67c28a7fcb865fa3521cc8dbcfbd52ed7bb38fa81e75db4ee4c30"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -3401,8 +3400,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-apple"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3688b6fbeaf1c0d06f7f1aad62a9f8014d65f83e9f88f47ff5fbd3d08a2657a2"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "anyhow",
  "async-task",
@@ -3441,8 +3439,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-linux"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071e92b9ec4553a13d9b5b623cb133ee8b1fa1d301ba2101844e2d2aa641f9c6"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -3486,8 +3483,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-macos"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd942d0efb252055a70d7ee8117e28e4327a58997b41899c8fac6ce46e757e4"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3528,8 +3524,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-macros"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16cfa16e2c6ccbd380a63404fb13c121e6251e5de66b53917c02b295394725e2"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -3540,8 +3535,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-platform"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2f21198a335e1a5825a3d07ac0bd777bdd05096e2dc029a239cd3131de99c68"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -3557,8 +3551,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-scheduler"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b9561e0dab2b98333fc0ff54836d90e147268d451f9f8aea87962dcb476b030"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "async-task",
  "backtrace",
@@ -3572,8 +3565,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-web"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd71748f4b0cf9f882c39ec6acfb1088f035f176255e1e01a16ce94d290d9505"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3601,8 +3593,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-wgpu"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae3cf1a515694f25b13f55472239a98f5a8986034887841e54e3a9e350e2669"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3630,8 +3621,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-windows"
 version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8051f3079f399692b4cddbcd413f08610a0bd30732e051ce5f9d0de331e3a9a5"
+source = "git+https://github.com/smelt-ai/gpui-fast?rev=1e19a6ace189bde2f8bf221415e59a4dd2588d49#1e19a6ace189bde2f8bf221415e59a4dd2588d49"
 dependencies = [
  "accesskit",
  "accesskit_windows",

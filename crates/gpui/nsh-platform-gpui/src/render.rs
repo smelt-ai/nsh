@@ -35,7 +35,10 @@
 //! images of a rounded card's children follow its corners, though other
 //! content (glyphs, borders) is clipped to its rectangle.
 
-use std::rc::Rc;
+use std::{
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use gpui::{
     App, Bounds, ContentMask, Corners, Edges, Element, ElementId, GlobalElementId, Hitbox,
@@ -87,6 +90,8 @@ struct Saved {
     clip_polygon: Option<Rc<[shape::Pt]>>,
 }
 
+static NEXT_PAINT_PASS: AtomicU64 = AtomicU64::new(1);
+
 /// The state of one drawing pass.
 pub(crate) struct DrawCx<'a> {
     /// The window painted into (in its paint phase).
@@ -118,6 +123,14 @@ pub(crate) struct DrawCx<'a> {
     /// Paths painted in this pass, and milliseconds spent rasterizing
     /// canvases, while frame statistics are kept ([`crate::stats`]).
     pub(crate) measured: Option<(u32, f64)>,
+    /// Monotonic id of the top-level paint pass.
+    pub(crate) paint_pass: u64,
+    /// True while capturing primitives inside `Window::paint_cached_layer`.
+    pub(crate) in_cached_capture: bool,
+    /// Cached layer composite hits during this paint pass.
+    pub(crate) cache_hits: u32,
+    /// Cached layer captures (misses) during this paint pass.
+    pub(crate) cache_misses: u32,
 }
 
 impl<'a> DrawCx<'a> {
@@ -129,6 +142,7 @@ impl<'a> DrawCx<'a> {
         dark: bool,
     ) -> Self {
         let scale = window.scale_factor();
+        let paint_pass = NEXT_PAINT_PASS.fetch_add(1, Ordering::Relaxed);
         crate::decor::new_pass();
         DrawCx {
             window,
@@ -144,6 +158,42 @@ impl<'a> DrawCx<'a> {
             saved: Vec::new(),
             drawn: Vec::new(),
             measured: None,
+            paint_pass,
+            in_cached_capture: false,
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    /// A sub-pass capturing primitives into a [`gpui::CachedLayerId`].
+    pub(crate) fn for_cached_capture(
+        window: &'a mut Window,
+        app: &'a mut App,
+        clip: Bounds<Pixels>,
+        dark: bool,
+        opacity: f32,
+        paint_pass: u64,
+        track_measured: bool,
+    ) -> Self {
+        let scale = window.scale_factor();
+        DrawCx {
+            window,
+            app,
+            transform: Mat4::new(),
+            scale,
+            dark,
+            opacity,
+            clip,
+            matrix: None,
+            rounded: None,
+            clip_polygon: None,
+            saved: Vec::new(),
+            drawn: Vec::new(),
+            measured: track_measured.then_some((0, 0.0)),
+            paint_pass,
+            in_cached_capture: true,
+            cache_hits: 0,
+            cache_misses: 0,
         }
     }
 
@@ -627,16 +677,32 @@ pub(crate) fn border_quad(
 /// parent's coordinates and `local` the view's into them
 /// ([`crate::view::ViewState::child_matrix`]).
 pub(crate) fn draw_view(cx: &mut DrawCx<'_>, view: &NshView, parent: Mat4, local: Mat4) {
+    let (hidden_or_zero, world, backface) = {
+        let state = view.state();
+        let hidden_or_zero = state.style.hidden || state.concealed || state.opacity() <= 0.0;
+        let world = Mat4::mul(&local, &parent);
+        let backface = !hidden_or_zero && crate::decor::backface_away(&state, &world);
+        (hidden_or_zero, world, backface)
+    };
+    if hidden_or_zero || backface {
+        view.release_cached_layers(cx.window);
+        return;
+    }
+    if crate::layer_cache::try_paint_cached_subtree(cx, view, world) {
+        return;
+    }
+    draw_view_uncached(cx, view, world);
+}
+
+/// Draws `view` and its subtree directly at precomputed `world` coordinates
+/// (without promoting `view` itself into a cached layer).
+pub(crate) fn draw_view_uncached(cx: &mut DrawCx<'_>, view: &NshView, world: Mat4) {
     let state = view.state();
     if state.style.hidden || state.concealed {
         return;
     }
     let opacity = state.opacity();
-    if opacity <= 0.0 {
-        return;
-    }
-    let world = Mat4::mul(&local, &parent);
-    if crate::decor::backface_away(&state, &world) {
+    if opacity <= 0.0 || crate::decor::backface_away(&state, &world) {
         return;
     }
     let matrix = crate::decor::color_matrix(&state);
@@ -672,6 +738,39 @@ pub(crate) fn root_matrix(view: &NshView, origin: (f32, f32)) -> Mat4 {
     }
 }
 
+/// `world` for a scroll view's content, moved by under half a device pixel
+/// so the content lands on whole device pixels whatever the scroll offset
+/// (a trackpad scrolls by fractions of a point), as GPUI's own scroll layers
+/// snap theirs: the content's cached layers are then reused as it scrolls
+/// instead of drawn again at each new fraction, and text keeps its place on
+/// the pixel grid. Hit testing keeps the exact offset; the two differ by
+/// less than a pixel. Zoomed content and transformed views draw as they are.
+fn snap_scrolled_content(scale: f32, state: &crate::view::ViewState, world: Mat4) -> Mat4 {
+    let Some(scroll) = state.scroll.as_ref() else {
+        return world;
+    };
+    if scroll.zooms() || scroll.zoom != 1.0 {
+        return world;
+    }
+    let Some((tx, ty)) = crate::layer_cache::is_pure_translation(&world) else {
+        return world;
+    };
+    let offset = scroll.origin();
+    // Where a child at the content's origin lands.
+    let x = if scroll.mirrored {
+        tx + state.frame.size.width.0 + offset.x.0
+    } else {
+        tx - offset.x.0
+    };
+    let y = ty - offset.y.0;
+    let snap = |at: f32| (at * scale).round() / scale - at;
+    let (dx, dy) = (snap(x), snap(y));
+    if dx == 0.0 && dy == 0.0 {
+        return world;
+    }
+    Mat4::new().translate(dx, dy).then(&world)
+}
+
 /// Draws what `view` draws and its subtree at `world` (set on the
 /// context): the content's shadow, shadows and background, the content
 /// clipped to the bounds, the border,
@@ -694,16 +793,16 @@ pub(crate) fn draw_content(cx: &mut DrawCx<'_>, view: &NshView, world: Mat4) {
     }
     crate::shader::draw(cx, &state);
     crate::text::draw(cx, &state);
-    crate::image::draw(cx, &state);
+    crate::image::draw(cx, view, &state);
     match cx.measured {
         Some(_) => {
             let start = std::time::Instant::now();
-            crate::canvas::draw(cx, &state);
+            crate::canvas::draw(cx, view, &state);
             if let Some((_, ms)) = &mut cx.measured {
                 *ms += start.elapsed().as_secs_f64() * 1e3;
             }
         }
-        None => crate::canvas::draw(cx, &state),
+        None => crate::canvas::draw(cx, view, &state),
     }
     // As on iOS and macOS: a view that does not clip has its border over
     // its own content and under its children (a label on an outlined field
@@ -715,13 +814,11 @@ pub(crate) fn draw_content(cx: &mut DrawCx<'_>, view: &NshView, world: Mat4) {
     }
     let natives = state.natives.clone();
     let culled = clip && cx.culled();
+    let content_world = snap_scrolled_content(cx.scale, &state, world);
     drop(state);
     if !culled {
         view.with_children(|children| {
-            for child in children {
-                let local = view.state().child_matrix(&child.state());
-                draw_view(cx, child, world, local);
-            }
+            crate::layer_cache::paint_children_with_cache(cx, view, content_world, children);
         });
     }
     cx.set_transform(world);
@@ -860,7 +957,9 @@ impl Element for SurfaceElement {
         );
         let drawn = {
             crate::canvas::begin_pass(surface.key());
+            crate::layer_cache::flush_removed(window, &surface.removed_layers_seq);
             let mut dcx = DrawCx::new(window, cx, bounds, dark);
+            crate::image::release_textures(&mut dcx);
             if surface.stats.borrow().is_some() {
                 dcx.measured = Some((0, 0.0));
             }
@@ -871,6 +970,9 @@ impl Element for SurfaceElement {
                 Mat4::new(),
                 root_matrix(&surface.root, origin),
             );
+            surface
+                .last_layer_cache_stats
+                .set((dcx.cache_hits, dcx.cache_misses));
             if let (Some(stats), Some((paths, canvas))) =
                 (surface.stats.borrow_mut().as_mut(), dcx.measured)
             {

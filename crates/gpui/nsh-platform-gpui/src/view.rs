@@ -18,8 +18,9 @@
 //! drawn in one pass, so damage is the window.
 
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     rc::{Rc, Weak},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 // The scroll position, extent and motion of a `ViewKind::Scroll` view.
@@ -314,15 +315,36 @@ impl ViewState {
     }
 }
 
+static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
 /// Called when a view of the tree changed: the root's surface draws again.
 pub(crate) type Invalidate = Rc<dyn Fn()>;
 
 struct Node {
+    uid: u64,
+    revision: Cell<u64>,
+    stable: Cell<(u64, u64, u32)>,
+    cache_info: Cell<Option<(u64, crate::layer_cache::SubtreeCacheInfo)>>,
+    has_cached_layer: Cell<bool>,
+    has_cached_in_subtree: Cell<bool>,
+    cached_runs: RefCell<Vec<u64>>,
     state: RefCell<ViewState>,
     parent: RefCell<Weak<Node>>,
     children: RefCell<Vec<NshView>>,
     /// Set on a surface's root only.
     invalidate: RefCell<Option<Invalidate>>,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        if self.has_cached_layer.get() {
+            crate::layer_cache::enqueue_removed(crate::layer_cache::subtree_layer_id(self.uid));
+        }
+        for id in self.cached_runs.borrow().iter().copied() {
+            crate::layer_cache::enqueue_removed(gpui::CachedLayerId::new(id));
+        }
+    }
 }
 
 /// The view of one node (a cheap, reference-counted handle).
@@ -350,11 +372,167 @@ impl NshView {
     /// A new, detached view of node `id`.
     pub(crate) fn new(id: NodeId, kind: ViewKind) -> Self {
         NshView(Rc::new(Node {
+            uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+            revision: Cell::new(NEXT_REVISION.fetch_add(1, Ordering::Relaxed)),
+            stable: Cell::new((0, 0, 0)),
+            cache_info: Cell::new(None),
+            has_cached_layer: Cell::new(false),
+            has_cached_in_subtree: Cell::new(false),
+            cached_runs: RefCell::new(Vec::new()),
             state: RefCell::new(ViewState::new(id, kind)),
             parent: RefCell::new(Weak::new()),
             children: RefCell::new(Vec::new()),
             invalidate: RefCell::new(None),
         }))
+    }
+
+    /// Stable process-unique view instance identifier (monotonic across node id recycling).
+    pub(crate) fn uid(&self) -> u64 {
+        self.0.uid
+    }
+
+    /// Monotonic subtree revision bumped on any change in this view or its descendants.
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.revision.get()
+    }
+
+    /// Records a paint pass for this view and returns the count of consecutive
+    /// earlier paint passes that saw the exact same revision.
+    pub(crate) fn observe_stability(&self, paint_pass: u64) -> u32 {
+        let rev = self.0.revision.get();
+        let (last_pass, last_rev, streak) = self.0.stable.get();
+        if last_pass == paint_pass {
+            return streak;
+        }
+        let next = if last_rev == rev {
+            streak.saturating_add(1)
+        } else {
+            0
+        };
+        self.0.stable.set((paint_pass, rev, next));
+        next
+    }
+
+    /// Returns memoized [`crate::layer_cache::SubtreeCacheInfo`] if it matches
+    /// this view's current revision.
+    pub(crate) fn cached_info(&self) -> Option<crate::layer_cache::SubtreeCacheInfo> {
+        let (rev, info) = self.0.cache_info.get()?;
+        (rev == self.0.revision.get()).then_some(info)
+    }
+
+    /// Memoizes [`crate::layer_cache::SubtreeCacheInfo`] for this view's current revision.
+    pub(crate) fn set_cached_info(&self, info: crate::layer_cache::SubtreeCacheInfo) {
+        self.0.cache_info.set(Some((self.0.revision.get(), info)));
+    }
+
+    /// Clears memoized [`crate::layer_cache::SubtreeCacheInfo`] up the
+    /// ancestor chain without changing revisions or resetting stability.
+    pub(crate) fn clear_cache_info(&self) {
+        let mut node = self.0.clone();
+        loop {
+            node.cache_info.set(None);
+            let parent = node.parent.borrow().upgrade();
+            match parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+    }
+
+    fn mark_cached_in_subtree(&self) {
+        let mut node = self.0.clone();
+        loop {
+            if node.has_cached_in_subtree.replace(true) {
+                break;
+            }
+            let parent = node.parent.borrow().upgrade();
+            match parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+    }
+
+    /// Marks whether this view currently owns an active single-subtree cached layer.
+    pub(crate) fn set_had_cached_layer(&self, active: bool) {
+        self.0.has_cached_layer.set(active);
+        if active {
+            self.mark_cached_in_subtree();
+        }
+    }
+
+    /// Takes and clears whether this view owned a single-subtree cached layer.
+    pub(crate) fn take_had_cached_layer(&self) -> bool {
+        self.0.has_cached_layer.replace(false)
+    }
+
+    /// Takes active static sibling run layer ids owned by this container.
+    pub(crate) fn take_cached_runs(&self) -> Vec<u64> {
+        if self.0.cached_runs.borrow().is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *self.0.cached_runs.borrow_mut())
+    }
+
+    /// Stores active static sibling run layer ids owned by this container.
+    pub(crate) fn set_cached_runs(&self, runs: Vec<u64>) {
+        if runs.is_empty() && self.0.cached_runs.borrow().is_empty() {
+            return;
+        }
+        let non_empty = !runs.is_empty();
+        *self.0.cached_runs.borrow_mut() = runs;
+        if non_empty {
+            self.mark_cached_in_subtree();
+        }
+    }
+
+    /// Immediately removes any cached layers owned by this view or its
+    /// descendants from `window`.
+    pub(crate) fn release_cached_layers(&self, window: &mut gpui::Window) {
+        if !self.0.has_cached_in_subtree.replace(false) {
+            return;
+        }
+        if self.0.has_cached_layer.replace(false) {
+            window.remove_cached_layer(crate::layer_cache::subtree_layer_id(self.0.uid));
+        }
+        if !self.0.cached_runs.borrow().is_empty() {
+            for id in self.0.cached_runs.borrow_mut().drain(..) {
+                window.remove_cached_layer(gpui::CachedLayerId::new(id));
+            }
+        }
+        self.with_children(|children| {
+            for child in children {
+                child.release_cached_layers(window);
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_any_cached_layer_in_subtree(&self) -> bool {
+        self.0.has_cached_layer.get()
+            || !self.0.cached_runs.borrow().is_empty()
+            || self.with_children(|children| {
+                children
+                    .iter()
+                    .any(NshView::has_any_cached_layer_in_subtree)
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cached_in_subtree_flag(&self) -> bool {
+        self.0.has_cached_in_subtree.get()
+    }
+
+    #[cfg(all(test, feature = "shot"))]
+    pub(crate) fn find_image_textures_present(&self) -> Option<[bool; 2]> {
+        if let Some(image) = self.state().image.as_ref() {
+            return Some(image.last_textures_present());
+        }
+        self.with_children(|children| {
+            children
+                .iter()
+                .find_map(NshView::find_image_textures_present)
+        })
     }
 
     /// Its state.
@@ -394,21 +572,34 @@ impl NshView {
         self.0.invalidate.borrow_mut().take();
     }
 
-    /// Something it draws changed: its surface draws again (if it is in
-    /// one).
-    pub(crate) fn changed(&self) {
+    fn bump_ancestors(&self) -> Rc<Node> {
+        let rev = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
         let mut node = self.0.clone();
         loop {
+            node.revision.set(rev);
+            node.cache_info.set(None);
             let parent = node.parent.borrow().upgrade();
             match parent {
                 Some(p) => node = p,
-                None => break,
+                None => return node,
             }
         }
-        let invalidate = node.invalidate.borrow().clone();
+    }
+
+    /// Something it draws changed: its surface draws again (if it is in
+    /// one).
+    pub(crate) fn changed(&self) {
+        let root = self.bump_ancestors();
+        let invalidate = root.invalidate.borrow().clone();
         if let Some(f) = invalidate {
             f();
         }
+    }
+
+    /// Bumps revision and clears memoized cache info up the ancestor chain
+    /// without triggering an extra surface invalidation.
+    pub(crate) fn bump_revision(&self) {
+        let _ = self.bump_ancestors();
     }
 
     /// Its frame, transform or shift changed.
@@ -481,6 +672,9 @@ impl NshView {
             .unwrap_or(children.len());
         children.insert(at, self.clone());
         drop(children);
+        if self.0.has_cached_in_subtree.get() {
+            parent.mark_cached_in_subtree();
+        }
         parent.changed();
     }
 

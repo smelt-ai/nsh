@@ -123,3 +123,17 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.regex-syntax]
 opt-level = 3
+
+# Use smelt-ai/gpui-fast crates workspace (`smelt/crates` branch, v0.1.19) with
+# caller-managed GPU tile-cached layers (`Window::paint_cached_layer`).
+[patch.crates-io]
+gpui-fast = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-apple = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-linux = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-macos = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-macros = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-platform = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-scheduler = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-web = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-wgpu = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }
+gpui-fast-windows = { git = "https://github.com/smelt-ai/gpui-fast", rev = "1e19a6ace189bde2f8bf221415e59a4dd2588d49" }

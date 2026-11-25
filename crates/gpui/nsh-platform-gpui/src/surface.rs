@@ -244,6 +244,11 @@ pub(crate) struct Surface {
     test_model: RefCell<Option<std::sync::Arc<nsh_testing::agent::Model>>>,
     /// Frame statistics, while they are logged ([`crate::stats`]).
     pub(crate) stats: RefCell<Option<crate::stats::FrameStats>>,
+    /// Sequence watermark of retired [`gpui::CachedLayerId`]s removed from the
+    /// main window on paint.
+    pub(crate) removed_layers_seq: Cell<u64>,
+    /// Cache `(hits, misses)` recorded during the most recent paint pass.
+    pub(crate) last_layer_cache_stats: Cell<(u32, u32)>,
     epoch: std::time::Instant,
     on_error: Handler<dyn Fn(&AppError)>,
     /// A dev session's error overlay: hears the errors besides `on_error`.
@@ -347,6 +352,8 @@ impl Surface {
             #[cfg(feature = "dev")]
             test_model: RefCell::default(),
             stats: RefCell::new(None),
+            removed_layers_seq: Cell::new(0),
+            last_layer_cache_stats: Cell::new((0, 0)),
             epoch: std::time::Instant::now(),
             on_error: RefCell::new(None),
             #[cfg(feature = "dev")]
@@ -618,6 +625,7 @@ impl Surface {
             s.frame.size.width.0 = width;
             s.frame.size.height.0 = height;
         }
+        self.root.bump_revision();
         let mut env = self.environment.get();
         env.window = nsh_core::Size::new(nsh_core::Points(width), nsh_core::Points(height));
         env.pixel_ratio = scale;

@@ -244,6 +244,7 @@ impl Mounter {
             MountItem::Events { id, events } => {
                 if let Some(view) = &self.get(*id) {
                     view.state_mut().events = *events;
+                    view.bump_revision();
                     crate::input::events_changed(surface, view);
                     crate::access::events_changed(view);
                     crate::file_drop::events_changed(surface, view);
@@ -292,6 +293,7 @@ impl Mounter {
             MountItem::Overflow { id, extent } => {
                 if let Some(view) = &self.get(*id) {
                     view.state_mut().overflow = *extent;
+                    view.bump_revision();
                 }
             }
             MountItem::Appearance { appearance } => {

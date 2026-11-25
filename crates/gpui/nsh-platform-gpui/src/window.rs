@@ -101,6 +101,9 @@ pub(crate) struct AppWindow {
     placed: RefCell<Vec<Rc<dyn Hosted>>>,
     /// The GPUI window's observers.
     subscriptions: RefCell<Vec<Subscription>>,
+    /// Sequence watermark of retired [`gpui::CachedLayerId`]s removed from
+    /// this window on paint.
+    removed_layers_seq: Cell<u64>,
 }
 
 impl AppWindow {
@@ -1330,6 +1333,7 @@ fn open(surface: &Rc<Surface>, view: &NshView, open: &OpenWindow) {
         settle: Cell::new(0),
         placed: RefCell::default(),
         subscriptions: RefCell::default(),
+        removed_layers_seq: Cell::new(0),
     });
     let weak = Rc::downgrade(&w);
     view.set_invalidate(Rc::new(move || {
@@ -2226,7 +2230,9 @@ impl Element for WindowElement {
         let drawn = {
             let _in = enter(&surface, Some(w.id));
             crate::canvas::begin_pass(surface.key());
+            crate::layer_cache::flush_removed(window, &w.removed_layers_seq);
             let mut dcx = crate::render::DrawCx::new(window, cx, bounds, dark);
+            crate::image::release_textures(&mut dcx);
             let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
             let local = crate::render::root_matrix(&w.view, origin);
             crate::render::draw_view(&mut dcx, &w.view, Mat4::new(), local);

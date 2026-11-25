@@ -323,6 +323,11 @@ fn windows(cx: &mut TestAppContext) {
     // SMELT: guest plugin VMs + pointerEvents: none share `crate::rt`.
     crate::plugin_tests::guest_plugins(cx);
     crate::plugin_tests::native_component_pointer_events_none_passes_clicks_to_parent(cx);
+    // Layer 2: GPU tile-cached layers for static sibling runs & subtrees.
+    static_sibling_run_caches_while_sibling_animates_and_invalidates_on_change(cx);
+    canvas_subtree_settles_and_caches_while_sibling_animates(cx);
+    hiding_ancestor_releases_descendant_cached_layers(cx);
+    image_placeholder_releases_and_tinted_variant_caches(cx);
 }
 
 /// These cases exercise window state or attributes through `currentWindow()`.
@@ -2443,8 +2448,7 @@ mount(App);
 fn what_is_drawn_over_a_native_component_takes_the_pointer(cx: &mut TestAppContext) {
     let code = nsh_bundler::compile_module("App.tsx", OVER_COMPONENT, &[]).unwrap();
     let log = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
-    let (view, cx) =
-        cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
     let component_log = log.clone();
     view.update(cx, |view, _| {
         view.register_component(
@@ -2583,8 +2587,7 @@ mount(App);
 fn a_press_on_a_native_component_closes_a_popover(cx: &mut TestAppContext) {
     let code = nsh_bundler::compile_module("App.tsx", POPOVER_OVER_COMPONENT, &[]).unwrap();
     let log = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
-    let (view, cx) =
-        cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
     let component_log = log.clone();
     view.update(cx, |view, _| {
         view.register_component(
@@ -2642,6 +2645,522 @@ fn a_press_on_a_native_component_closes_a_popover(cx: &mut TestAppContext) {
     );
     heard(cx, "closed");
     assert!(log.borrow().iter().any(|line| line == "press under"));
+    view.update(cx, |view, _| view.stop());
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+const LAYER_CACHE_APP: &str = r##"
+import { mount, nativeComponent, signal, Text, View } from "nsh";
+
+const Pad = nativeComponent<{ name: string; heard?: string }, {}>("test.pad", { props: ["name", "heard"], events: [] });
+const ROWS = [0, 1, 2, 3, 4, 5];
+
+function App() {
+  const pulse = signal(0);
+  const label = signal("Static 0");
+  const showRows = signal(true);
+  const heard = signal("ready");
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "#ffffff" }}>
+      <View
+        role="button"
+        onPress={() => {
+          const next = pulse() + 1;
+          pulse.set(next);
+          heard.set(`pulse ${next}`);
+        }}
+        style={{
+          width: 300,
+          height: 30,
+          backgroundColor: pulse() % 2 === 0 ? "#114488" : "#884411",
+        }}
+      >
+        <Text>Pulse {pulse()}</Text>
+      </View>
+      <View
+        role="button"
+        onPress={() => {
+          label.set("Updated 0");
+          heard.set("mutated");
+        }}
+        style={{ width: 140, height: 30, backgroundColor: "#eeeeee" }}
+      />
+      <View
+        role="button"
+        onPress={() => {
+          showRows.set(false);
+          heard.set("unmounted");
+        }}
+        style={{ width: 140, height: 30, backgroundColor: "#dddddd" }}
+      />
+      {showRows() ? (
+        <View style={{ width: 320, height: 260 }}>
+          {ROWS.map((i) => (
+            <View key={i} style={{ width: 300, height: 36, backgroundColor: "#223344" }}>
+              <Text>{i === 0 ? label() : `Static ${i}`}</Text>
+            </View>
+          ))}
+          <Pad name="sibling" heard={heard()} style={{ width: 300, height: 40 }} />
+        </View>
+      ) : (
+        <Pad name="sibling" heard={heard()} style={{ width: 300, height: 40 }} />
+      )}
+    </View>
+  );
+}
+mount(App);
+"##;
+
+fn static_sibling_run_caches_while_sibling_animates_and_invalidates_on_change(
+    cx: &mut TestAppContext,
+) {
+    let code = nsh_bundler::compile_module("App.tsx", LAYER_CACHE_APP, &[]).unwrap();
+    let log = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    let component_log = log.clone();
+    view.update(cx, |view, _| {
+        view.register_component(
+            "test.pad",
+            Rc::new(move |_| {
+                Box::new(Pad {
+                    log: component_log.clone(),
+                    name: String::new(),
+                })
+            }),
+        );
+        view.load(App::Js(Bundle::source(code)));
+    });
+    let draw_frame = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    };
+    let wait_msg = |cx: &mut VisualTestContext, wanted: &str| {
+        wait_until_window(cx, wanted, |cx| {
+            draw_frame(cx);
+            log.borrow().iter().any(|line| line == wanted)
+        });
+    };
+
+    wait_msg(cx, "ready");
+    // Step through several pulses of the top button so the 6 static sibling rows
+    // surpass STABLE_FRAMES, populate the GPU cached layer, and hit cache while
+    // the sibling button and native Pad change on every step.
+    let none = gpui::Modifiers::default();
+    let at = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+    for step in 1..=5 {
+        cx.simulate_click(at(50.0, 15.0), none);
+        wait_msg(cx, &format!("pulse {step}"));
+    }
+    let stats_hit = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert!(
+        stats_hit.0 >= 1 && stats_hit.1 == 0,
+        "expected static sibling run cache hit with 0 misses after warmup, got {stats_hit:?}"
+    );
+
+    // Mutate Row 0 inside the static sibling run: cache must invalidate cleanly.
+    cx.simulate_click(at(50.0, 45.0), none);
+    wait_msg(cx, "mutated");
+    // Next pulse re-stabilizes and hits cache again.
+    for step in 6..=9 {
+        cx.simulate_click(at(50.0, 15.0), none);
+        wait_msg(cx, &format!("pulse {step}"));
+    }
+    let stats_rehit = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert!(
+        stats_rehit.0 >= 1 && stats_rehit.1 == 0,
+        "expected static sibling run to re-cache after mutation, got {stats_rehit:?}"
+    );
+
+    // Native component (Hosted) right after the cached sibling run must still be
+    // placed and receive pointer events normally.
+    log.borrow_mut().clear();
+    cx.simulate_click(at(50.0, 315.0), none);
+    wait_msg(cx, "press sibling");
+
+    // Unmount the cached container: retired layer ids must flush cleanly.
+    cx.simulate_click(at(50.0, 75.0), none);
+    wait_msg(cx, "unmounted");
+    draw_frame(cx);
+    draw_frame(cx);
+    let stats_after_unmount = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert_eq!(stats_after_unmount, (0, 0));
+
+    view.update(cx, |view, _| view.stop());
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+const CANVAS_CACHE_APP: &str = r##"
+import { Canvas, mount, nativeComponent, signal, Text, View } from "nsh";
+
+const Pad = nativeComponent<{ name: string; heard?: string }, {}>("test.pad", { props: ["name", "heard"], events: [] });
+
+function App() {
+  const pulse = signal(0);
+  const heard = signal("ready");
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "#ffffff" }}>
+      <View
+        role="button"
+        onPress={() => {
+          const next = pulse() + 1;
+          pulse.set(next);
+          heard.set(`pulse ${next}`);
+        }}
+        style={{
+          width: 300,
+          height: 30,
+          backgroundColor: pulse() % 2 === 0 ? "#114488" : "#884411",
+        }}
+      >
+        <Text>Pulse {pulse()}</Text>
+      </View>
+      <View style={{ width: 320, height: 140 }}>
+        <Canvas
+          style={{ width: 120, height: 120 }}
+          draw={(c) => {
+            c.fillStyle = "#cc3311";
+            c.fillRect(10, 10, 80, 80);
+          }}
+        />
+        <Text>Static Canvas</Text>
+      </View>
+      <Pad name="sibling" heard={heard()} style={{ width: 300, height: 40 }} />
+    </View>
+  );
+}
+mount(App);
+"##;
+
+fn canvas_subtree_settles_and_caches_while_sibling_animates(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", CANVAS_CACHE_APP, &[]).unwrap();
+    let log = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    let component_log = log.clone();
+    view.update(cx, |view, _| {
+        view.register_component(
+            "test.pad",
+            Rc::new(move |_| {
+                Box::new(Pad {
+                    log: component_log.clone(),
+                    name: String::new(),
+                })
+            }),
+        );
+        view.load(App::Js(Bundle::source(code)));
+    });
+    let draw_frame = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    };
+    let wait_msg = |cx: &mut VisualTestContext, wanted: &str| {
+        wait_until_window(cx, wanted, |cx| {
+            draw_frame(cx);
+            log.borrow().iter().any(|line| line == wanted)
+        });
+    };
+
+    wait_msg(cx, "ready");
+    let none = gpui::Modifiers::default();
+    let at = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+    for step in 1..=5 {
+        cx.simulate_click(at(50.0, 15.0), none);
+        wait_msg(cx, &format!("pulse {step}"));
+    }
+    let stats = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert!(
+        stats.0 >= 1 && stats.1 == 0,
+        "expected canvas subtree to settle and hit cache while sibling updates, got {stats:?}"
+    );
+
+    view.update(cx, |view, _| view.stop());
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+const HIDE_ANCESTOR_CACHE_APP: &str = r##"
+import { mount, nativeComponent, signal, Text, View } from "nsh";
+
+const Pad = nativeComponent<{ name: string; heard?: string }, {}>("test.pad", { props: ["name", "heard"], events: [] });
+const ROWS = [0, 1, 2, 3, 4, 5];
+
+function App() {
+  const pulse = signal(0);
+  const hideParent = signal(false);
+  const heard = signal("ready");
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "#ffffff" }}>
+      <View
+        role="button"
+        onPress={() => {
+          const next = pulse() + 1;
+          pulse.set(next);
+          heard.set(`pulse ${next}`);
+        }}
+        style={{
+          width: 300,
+          height: 30,
+          backgroundColor: pulse() % 2 === 0 ? "#114488" : "#884411",
+        }}
+      >
+        <Text>Pulse {pulse()}</Text>
+      </View>
+      <View
+        role="button"
+        onPress={() => {
+          const next = !hideParent();
+          hideParent.set(next);
+          heard.set(next ? "hidden" : "shown");
+        }}
+        style={{ width: 140, height: 30, backgroundColor: "#eeeeee" }}
+      />
+      <View
+        style={{
+          width: 340,
+          height: 260,
+          visibility: hideParent() ? "hidden" : "visible",
+        }}
+      >
+        <View style={{ width: 320, height: 200 }}>
+          {ROWS.map((i) => (
+            <View key={i} style={{ width: 300, height: 30, backgroundColor: "#223344" }}>
+              <Text>Row {i}</Text>
+            </View>
+          ))}
+        </View>
+        <Pad name="inner" heard={heard()} style={{ width: 300, height: 40 }} />
+      </View>
+    </View>
+  );
+}
+mount(App);
+"##;
+
+fn hiding_ancestor_releases_descendant_cached_layers(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", HIDE_ANCESTOR_CACHE_APP, &[]).unwrap();
+    let log = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    let component_log = log.clone();
+    view.update(cx, |view, _| {
+        view.register_component(
+            "test.pad",
+            Rc::new(move |_| {
+                Box::new(Pad {
+                    log: component_log.clone(),
+                    name: String::new(),
+                })
+            }),
+        );
+        view.load(App::Js(Bundle::source(code)));
+    });
+    let draw_frame = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    };
+    let wait_msg = |cx: &mut VisualTestContext, wanted: &str| {
+        wait_until_window(cx, wanted, |cx| {
+            draw_frame(cx);
+            log.borrow().iter().any(|line| line == wanted)
+        });
+    };
+
+    wait_msg(cx, "ready");
+    let none = gpui::Modifiers::default();
+    let at = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+    for step in 1..=5 {
+        cx.simulate_click(at(50.0, 15.0), none);
+        wait_msg(cx, &format!("pulse {step}"));
+    }
+    let stats_hit = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert!(
+        stats_hit.0 >= 1 && stats_hit.1 == 0,
+        "expected descendant cached layer hit before hiding, got {stats_hit:?}"
+    );
+    assert!(
+        view.read_with(cx, |v, _| v
+            .surface()
+            .root
+            .has_any_cached_layer_in_subtree()),
+        "expected root tree to track descendant cached layer"
+    );
+
+    // Hide the ancestor container: descendant cached layers must release on the very first paint.
+    cx.simulate_click(at(50.0, 45.0), none);
+    wait_msg(cx, "hidden");
+    let stats_hidden = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert_eq!(stats_hidden, (0, 0));
+    fn find_hidden_flag(v: &crate::view::NshView) -> Option<bool> {
+        if v.state().style.hidden {
+            return Some(v.has_cached_in_subtree_flag());
+        }
+        v.with_children(|children| children.iter().find_map(find_hidden_flag))
+    }
+    let (any_cached, hidden_flag) = view.read_with(cx, |v, _| {
+        let r = &v.surface().root;
+        (r.has_any_cached_layer_in_subtree(), find_hidden_flag(r))
+    });
+    assert!(
+        !any_cached,
+        "hiding ancestor leaked descendant cached layer"
+    );
+    assert_eq!(
+        hidden_flag,
+        Some(false),
+        "hiding ancestor left has_cached_in_subtree set"
+    );
+
+    // Re-show the ancestor: descendant re-stabilizes and hits cache cleanly.
+    cx.simulate_click(at(50.0, 45.0), none);
+    wait_msg(cx, "shown");
+    for step in 6..=10 {
+        cx.simulate_click(at(50.0, 15.0), none);
+        wait_msg(cx, &format!("pulse {step}"));
+    }
+    let stats_reshown = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert!(
+        stats_reshown.0 >= 1 && stats_reshown.1 == 0,
+        "expected descendant to re-cache after unhide, got {stats_reshown:?}"
+    );
+
+    view.update(cx, |view, _| view.stop());
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+const IMAGE_CACHE_APP: &str = r##"
+import { Image, mount, nativeComponent, signal, Text, View } from "nsh";
+
+const Pad = nativeComponent<{ name: string; heard?: string }, {}>("test.pad", { props: ["name", "heard"], events: [] });
+const PLACEHOLDER_SVG =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3Crect width='64' height='64' fill='%23ff0000'/%3E%3C/svg%3E";
+const MAIN_SVG =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3Crect width='64' height='64' fill='%2300ff00'/%3E%3C/svg%3E";
+
+function App() {
+  const pulse = signal(0);
+  const useMain = signal(false);
+  const heard = signal("ready");
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "#ffffff" }}>
+      <View
+        role="button"
+        onPress={() => {
+          const next = pulse() + 1;
+          pulse.set(next);
+          heard.set(`pulse ${next}`);
+        }}
+        style={{
+          width: 300,
+          height: 30,
+          backgroundColor: pulse() % 2 === 0 ? "#114488" : "#884411",
+        }}
+      >
+        <Text>Pulse {pulse()}</Text>
+      </View>
+      <View
+        role="button"
+        onPress={() => {
+          useMain.set(true);
+          heard.set("load main");
+        }}
+        style={{ width: 140, height: 30, backgroundColor: "#eeeeee" }}
+      />
+      <View style={{ width: 320, height: 180 }}>
+        <Image
+          placeholder={PLACEHOLDER_SVG}
+          src={useMain() ? MAIN_SVG : undefined}
+          style={{ width: 120, height: 120, tintColor: "#2288ff" }}
+        />
+        <Text>Image Title</Text>
+        <Text>Image Subtitle</Text>
+      </View>
+      <Pad name="sibling" heard={heard()} style={{ width: 300, height: 40 }} />
+    </View>
+  );
+}
+mount(App);
+"##;
+
+fn image_placeholder_releases_and_tinted_variant_caches(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", IMAGE_CACHE_APP, &[]).unwrap();
+    let log = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    let component_log = log.clone();
+    view.update(cx, |view, _| {
+        view.register_component(
+            "test.pad",
+            Rc::new(move |_| {
+                Box::new(Pad {
+                    log: component_log.clone(),
+                    name: String::new(),
+                })
+            }),
+        );
+        view.load(App::Js(Bundle::source(code)));
+    });
+    let draw_frame = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    };
+    let wait_msg = |cx: &mut VisualTestContext, wanted: &str| {
+        wait_until_window(cx, wanted, |cx| {
+            draw_frame(cx);
+            log.borrow().iter().any(|line| line == wanted)
+        });
+    };
+
+    wait_msg(cx, "ready");
+    wait_until_window(cx, "placeholder texture retained in slot 0", |cx| {
+        draw_frame(cx);
+        view.read_with(cx, |v, _| {
+            v.surface().root.find_image_textures_present() == Some([true, false])
+        })
+    });
+
+    let none = gpui::Modifiers::default();
+    let at = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+    cx.simulate_click(at(50.0, 45.0), none);
+    wait_msg(cx, "load main");
+
+    // Wait for main image decode + tinted variant worker to settle and release slot 0.
+    wait_until_window(cx, "main settled and placeholder slot released", |cx| {
+        draw_frame(cx);
+        view.read_with(cx, |v, _| {
+            v.surface().root.find_image_textures_present() == Some([false, true])
+        })
+    });
+
+    for step in 1..=6 {
+        cx.simulate_click(at(50.0, 15.0), none);
+        wait_msg(cx, &format!("pulse {step}"));
+    }
+    let stats = view.read_with(cx, |v, _| v.surface().last_layer_cache_stats.get());
+    assert!(
+        stats.0 >= 1 && stats.1 == 0,
+        "expected tinted image subtree to settle and cache while sibling updates, got {stats:?}"
+    );
+    assert_eq!(
+        view.read_with(cx, |v, _| v.surface().root.find_image_textures_present()),
+        Some([false, true])
+    );
+
     view.update(cx, |view, _| view.stop());
     cx.update(|window, _| window.remove_window());
     cx.run_until_parked();

@@ -219,6 +219,46 @@ impl CanvasState {
         }
     }
 
+    /// True when this canvas has no pending async rasterization, partial damage,
+    /// or unloading bitmaps, so its output can safely be captured into a GPU
+    /// cached layer.
+    pub(crate) fn is_cacheable(&self) -> bool {
+        if self.drawing.is_none() {
+            return true;
+        }
+        if self.inflight.get().is_some()
+            || self.images.values().any(Option::is_none)
+            || self.damage.get().is_some()
+        {
+            return false;
+        }
+        self.cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|recorded| recorded.version == self.version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_settled_for_test(&self) {
+        *self.cache.borrow_mut() = Some(Recorded {
+            key: Key {
+                linear: [1.0, 0.0, 0.0, 1.0],
+                scale: 1.0,
+                size: (120.0, 120.0),
+            },
+            region: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 120,
+                y1: 120,
+            },
+            frac: (0.0, 0.0),
+            layers: Vec::new(),
+            version: self.version,
+            args: Vec::new(),
+        });
+    }
+
     /// The value of animated value slot `k`, as damage scans read it.
     fn slot(args: &[Option<AnimationValue>], k: u16) -> f32 {
         args.get(k as usize)
@@ -457,7 +497,7 @@ fn premultiplied(width: u32, height: u32, bgra: &[u8]) -> Result<sk::Pixmap, Str
 }
 
 /// Draws a canvas: rasterizes it first if needed.
-pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
+pub(crate) fn draw(cx: &mut DrawCx<'_>, view: &NshView, state: &ViewState) {
     // Pixmaps uploaded before and dropped since leave the atlas.
     crate::image::release_textures(cx);
     let Some(canvas) = state.canvas.as_ref() else {
@@ -492,112 +532,123 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
     let Some((region, shown)) = region(&key, frac, clip) else {
         return;
     };
-    let mut cache = canvas.cache.borrow_mut();
-    let mut fresh = cache
-        .as_ref()
-        .is_some_and(|r| r.key == key && r.region.contains(&shown));
-    let damage = canvas.damage.take();
-    let outdated = cache.as_ref().is_some_and(|r| r.version != canvas.version);
-    if fresh && outdated {
-        // A new drawing: a worker rasterizes it while the last one shows
-        // (a frame or two); damage is worked out again when it is done.
-        // The latest is asked for when the one in flight lands.
-        if let Some(version) = canvas.ask() {
-            spawn(Job {
-                surface: SURFACE.get(),
-                id: state.id,
-                drawing: drawing.clone(),
-                args: canvas.args.clone(),
-                images: canvas.images.clone(),
-                system: cx.app.text_system().clone(),
+    let was_cacheable = canvas.is_cacheable();
+    {
+        let mut cache = canvas.cache.borrow_mut();
+        let mut fresh = cache
+            .as_ref()
+            .is_some_and(|r| r.key == key && r.region.contains(&shown));
+        let damage = canvas.damage.take();
+        let outdated = cache.as_ref().is_some_and(|r| r.version != canvas.version);
+        if fresh && outdated {
+            // A new drawing: a worker rasterizes it while the last one shows
+            // (a frame or two); damage is worked out again when it is done.
+            // The latest is asked for when the one in flight lands.
+            if let Some(version) = canvas.ask() {
+                spawn(Job {
+                    surface: SURFACE.get(),
+                    id: state.id,
+                    drawing: drawing.clone(),
+                    args: canvas.args.clone(),
+                    images: canvas.images.clone(),
+                    system: cx.app.text_system().clone(),
+                    key,
+                    region,
+                    frac,
+                    version,
+                    opacity: cx.opacity,
+                });
+            }
+        } else if fresh
+            && let Some(Damage::Rect(r)) = damage
+            && let Some(recorded) = cache.as_mut()
+        {
+            let text = cx.window.text_system().clone();
+            let system = cx.app.text_system().clone();
+            fresh = patch(
+                recorded,
+                drawing,
+                &canvas.args,
+                &canvas.images,
+                (&text, &system),
+                r,
+            );
+        }
+        if !fresh {
+            let text = cx.window.text_system().clone();
+            let system = cx.app.text_system().clone();
+            let started = std::time::Instant::now();
+            let recorded = record(
+                drawing,
+                &canvas.args,
+                &canvas.images,
+                (&text, &system),
                 key,
                 region,
                 frac,
-                version,
-                opacity: cx.opacity,
+            );
+            log::debug!(
+                target: "nsh::perf",
+                "canvas: {}×{} px rasterized in {:.2} ms",
+                region.width(),
+                region.height(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            *cache = Some(Recorded {
+                version: canvas.version,
+                ..recorded
             });
         }
-    } else if fresh
-        && let Some(Damage::Rect(r)) = damage
-        && let Some(recorded) = cache.as_mut()
-    {
-        let text = cx.window.text_system().clone();
-        let system = cx.app.text_system().clone();
-        fresh = patch(
-            recorded,
-            drawing,
-            &canvas.args,
-            &canvas.images,
-            (&text, &system),
-            r,
-        );
-    }
-    if !fresh {
-        let text = cx.window.text_system().clone();
-        let system = cx.app.text_system().clone();
-        let started = std::time::Instant::now();
-        let recorded = record(
-            drawing,
-            &canvas.args,
-            &canvas.images,
-            (&text, &system),
-            key,
-            region,
-            frac,
-        );
-        log::debug!(
-            target: "nsh::perf",
-            "canvas: {}×{} px rasterized in {:.2} ms",
-            region.width(),
-            region.height(),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-        *cache = Some(Recorded {
-            version: canvas.version,
-            ..recorded
-        });
-    }
-    let Some(recorded) = cache.as_mut() else {
-        return;
-    };
-    // The pixmap's top left, in device pixels: whole pixels, so its pixels
-    // stay the screen's.
-    let left = (origin.0 - recorded.frac.0).round() + recorded.region.x0 as f32;
-    let top = (origin.1 - recorded.frac.1).round() + recorded.region.y0 as f32;
-    let opacity = cx.opacity;
-    for layer in &mut recorded.layers {
-        match layer {
-            Layer::Pixels(pixmap, tiled) => {
-                if tiled.is_empty() {
-                    *tiled = tiles(pixmap.width(), pixmap.height());
-                }
-                for tile in tiled.iter_mut() {
-                    if tile.uploaded.as_ref().is_none_or(|(o, _)| *o != opacity) {
-                        let image = upload(pixmap, tile.rect, opacity).map(Texture::new);
-                        tile.uploaded = Some((opacity, image));
-                    }
-                    let Some((_, Some(image))) = &tile.uploaded else {
-                        continue;
-                    };
-                    let r = tile.rect;
-                    let rect = bounds(
-                        (left + r.x0 as f32) / s,
-                        (top + r.y0 as f32) / s,
-                        r.width() as f32 / s,
-                        r.height() as f32 / s,
-                    );
-                    let image = image.image().clone();
-                    cx.paint(|window, _| {
-                        let painted =
-                            window.paint_image(rect, rect, Default::default(), image, 0, false);
-                        if let Err(e) = painted {
-                            log::debug!("canvas: not painted: {e}");
+        if let Some(recorded) = cache.as_mut() {
+            // The pixmap's top left, in device pixels: whole pixels, so its pixels
+            // stay the screen's.
+            let left = (origin.0 - recorded.frac.0).round() + recorded.region.x0 as f32;
+            let top = (origin.1 - recorded.frac.1).round() + recorded.region.y0 as f32;
+            let opacity = cx.opacity;
+            for layer in &mut recorded.layers {
+                match layer {
+                    Layer::Pixels(pixmap, tiled) => {
+                        if tiled.is_empty() {
+                            *tiled = tiles(pixmap.width(), pixmap.height());
                         }
-                    });
+                        for tile in tiled.iter_mut() {
+                            if tile.uploaded.as_ref().is_none_or(|(o, _)| *o != opacity) {
+                                let image = upload(pixmap, tile.rect, opacity).map(Texture::new);
+                                tile.uploaded = Some((opacity, image));
+                            }
+                            let Some((_, Some(image))) = &tile.uploaded else {
+                                continue;
+                            };
+                            let r = tile.rect;
+                            let rect = bounds(
+                                (left + r.x0 as f32) / s,
+                                (top + r.y0 as f32) / s,
+                                r.width() as f32 / s,
+                                r.height() as f32 / s,
+                            );
+                            let image = image.image().clone();
+                            cx.paint(|window, _| {
+                                let painted = window.paint_image(
+                                    rect,
+                                    rect,
+                                    Default::default(),
+                                    image,
+                                    0,
+                                    false,
+                                );
+                                if let Err(e) = painted {
+                                    log::debug!("canvas: not painted: {e}");
+                                }
+                            });
+                        }
+                    }
+                    Layer::Text(runs) => paint_text(cx, runs, (left, top)),
                 }
             }
-            Layer::Text(runs) => paint_text(cx, runs, (left, top)),
         }
+    }
+    if canvas.is_cacheable() != was_cacheable {
+        view.clear_cache_info();
     }
 }
 

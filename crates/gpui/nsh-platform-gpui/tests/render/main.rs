@@ -249,6 +249,10 @@ fn main() {
         output.as_deref(),
     );
     println!("render: zoomed scroll views draw their content scaled: ok");
+    layer_cache_follows_subpixel_moves(&mut cx, output.as_deref());
+    println!("render: a cached layer scrolled by part of a pixel matches drawing it directly: ok");
+    layer_cache_preserves_static_pixels(&mut cx);
+    println!("render: layer cache matches uncached pixels across static runs & overflow: ok");
     if let Some(output) = &output {
         embedding_screenshots(&mut cx, output);
     }
@@ -460,6 +464,245 @@ fn zoom_frames(cx: &mut HeadlessAppContext) {
             times[times.len() / 2],
             times[times.len() * 95 / 100],
             times[times.len() - 1],
+        );
+    }
+}
+
+/// Static sibling cards (including a translucent pill and an overflowing badge
+/// like `<Avatar>`) next to an animating sibling must render identically before
+/// and after promoting into a GPU tile-cached layer.
+fn layer_cache_preserves_static_pixels(cx: &mut HeadlessAppContext) {
+    let code = r##"
+import { mount, signal, Text, View } from "nsh";
+
+const EXTRA = [1, 2, 3, 4];
+
+function App() {
+  const phase = signal(0);
+  setInterval(() => phase.set(phase() + 1), 20);
+  return (
+    <View style={{ flex: 1, backgroundColor: "#ffffff" }}>
+      <View style={{ position: "absolute", left: 10, top: 10, width: 160, height: 150 }}>
+        <View style={{ width: 150, height: 40, backgroundColor: "#e8eef8", borderRadius: 8 }}>
+          <View
+            style={{
+              position: "absolute",
+              left: 12,
+              top: 10,
+              width: 50,
+              height: 20,
+              borderRadius: 6,
+              backgroundColor: "rgba(220, 40, 40, 0.5)",
+            }}
+          />
+          <View
+            style={{
+              position: "absolute",
+              right: -12,
+              top: 10,
+              width: 24,
+              height: 20,
+              borderRadius: 4,
+              backgroundColor: "rgba(0, 180, 0, 0.5)",
+            }}
+          />
+        </View>
+        {EXTRA.map((i) => (
+          <View key={i} style={{ width: 150, height: 24, backgroundColor: "#d0dcf0" }}>
+            <Text style={{ fontSize: 10, color: "#141b24" }}>Row {i}</Text>
+          </View>
+        ))}
+      </View>
+      <View
+        style={{
+          position: "absolute",
+          left: 195,
+          top: 20,
+          width: 30,
+          height: 30,
+          backgroundColor: phase() % 2 === 0 ? "#0000ff" : "#ff00ff",
+        }}
+      />
+    </View>
+  );
+}
+mount(App);
+"##;
+
+    let window = open(cx, code);
+    let start = Instant::now();
+    // Wait until the initial frame has painted the static cards.
+    let baseline = loop {
+        draw(cx, window);
+        let shot = cx.capture_screenshot(window.into()).unwrap();
+        let scale = shot.width() as f32 / 240.0;
+        if pixel(&shot, scale, (15.0, 20.0)) != WHITE {
+            break shot;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for initial paint"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let scale = baseline.width() as f32 / 240.0;
+
+    // Advance enough frames + timer ticks so the animating sibling changes color
+    // while the static sibling cards stabilize past STABLE_FRAMES and composite
+    // from the GPU tile cache.
+    let mut saw_anim_change = false;
+    let first_anim = pixel(&baseline, scale, (210.0, 35.0));
+    let mut cached = baseline.clone();
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(30));
+        draw(cx, window);
+        cached = cx.capture_screenshot(window.into()).unwrap();
+        if pixel(&cached, scale, (210.0, 35.0)) != first_anim {
+            saw_anim_change = true;
+        }
+    }
+    assert!(saw_anim_change, "animating sibling never updated");
+
+    let check_points = [
+        ((15.0, 20.0), "card 0 background"),
+        ((40.0, 30.0), "translucent red pill over card 0"),
+        // Right edge of card 0 is at x = 10 + 150 = 160; overflowing badge reaches 172.
+        (
+            (166.0, 30.0),
+            "overflowing translucent green badge over white",
+        ),
+        ((40.0, 62.0), "row 1 background"),
+        ((40.0, 110.0), "row 3 background"),
+    ];
+    for (pt, what) in check_points {
+        let before = pixel(&baseline, scale, pt);
+        let after = pixel(&cached, scale, pt);
+        let diff = before
+            .iter()
+            .zip(&after)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            diff <= 2,
+            "{what} at {pt:?} differed after caching: before={before:?} after={after:?}"
+        );
+    }
+    cx.update(|cx| window.update(cx, |view, _, _| view.stop()).unwrap());
+}
+
+/// Static text in a scroll view scrolled by a fraction of a point (a
+/// trackpad's delta), while a sibling keeps the content from being cached as
+/// a whole so the text has a cached layer of its own: drawn from that layer,
+/// it must come out on the pixels drawing it directly puts it on.
+fn layer_cache_follows_subpixel_moves(cx: &mut HeadlessAppContext, output: Option<&Path>) {
+    let code = r##"
+import { mount, Scroll, signal, Text, View } from "nsh";
+
+const LINES = [
+  "插件只在 SQLite 里保存一个扫描 ID",
+  "目录和大小数据仍由运行时保管",
+  "Plugins keep only a scan id here",
+  "比较合理的是把扫描结果本身存下来",
+  "下次打开先显示上次结果和扫描时间",
+  "then offer to scan again.",
+];
+
+function App() {
+  const phase = signal(0);
+  setInterval(() => phase.set(phase() + 1), 20);
+  return (
+    <View style={{ flex: 1, backgroundColor: "#ffffff" }}>
+      <Scroll
+        ref={(r: any) => setTimeout(() => r.scrollTo({ y: 3.25, animated: false }), 400)}
+        style={{ position: "absolute", left: 10, top: 10, width: 220, height: 160 }}
+      >
+        <View style={{ width: 200 }}>
+          {LINES.map((line) => (
+            <Text style={{ fontSize: 13, lineHeight: 20, color: "#141b24" }}>{line}</Text>
+          ))}
+        </View>
+        <View
+          style={{
+            width: 10,
+            height: 10,
+            backgroundColor: phase() % 2 === 0 ? "#0000ff" : "#ff00ff",
+          }}
+        />
+        <View style={{ height: 200 }} />
+      </Scroll>
+    </View>
+  );
+}
+mount(App);
+"##;
+
+    let window = open(cx, code);
+    // Long enough for the text to be cached, then scrolled (at 400 ms) and
+    // drawn from its layer.
+    let start = Instant::now();
+    let mut before = None;
+    while start.elapsed() < Duration::from_millis(900) {
+        draw(cx, window);
+        if before.is_none() && start.elapsed() > Duration::from_millis(300) {
+            before = Some(cx.capture_screenshot(window.into()).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let before = before.unwrap();
+    let cached = cx.capture_screenshot(window.into()).unwrap();
+    cx.update_window(window.into(), |_, window, _| {
+        window.set_scroll_layers(false)
+    })
+    .unwrap();
+    draw(cx, window);
+    let direct = cx.capture_screenshot(window.into()).unwrap();
+    cx.update(|cx| window.update(cx, |view, _, _| view.stop()).unwrap());
+
+    let scale = direct.width() as f32 / 240.0;
+    let (x0, y0) = ((8.0 * scale) as u32, (8.0 * scale) as u32);
+    let (x1, y1) = ((212.0 * scale) as u32, (134.0 * scale) as u32);
+    let region = |shot: &image::RgbaImage| -> Vec<[u8; 4]> {
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .map(|(x, y)| shot.get_pixel(x, y).0)
+            .collect()
+    };
+    assert!(
+        region(&direct).iter().any(|p| p[0] < 128),
+        "the text was never drawn"
+    );
+    assert!(
+        region(&before) != region(&direct),
+        "the text never scrolled"
+    );
+    let mut differing = 0usize;
+    let mut worst = (0u8, 0u32, 0u32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (a, b) = (cached.get_pixel(x, y).0, direct.get_pixel(x, y).0);
+            let delta = (0..3).map(|c| a[c].abs_diff(b[c])).max().unwrap_or(0);
+            if delta > 2 {
+                differing += 1;
+                if delta > worst.0 {
+                    worst = (delta, x, y);
+                }
+            }
+        }
+    }
+    if differing > 0 {
+        if let Some(output) = output {
+            cached
+                .save(output.join("nsh-subpixel-scroll-cached.png"))
+                .unwrap();
+            direct
+                .save(output.join("nsh-subpixel-scroll-direct.png"))
+                .unwrap();
+        }
+        panic!(
+            "{differing} text pixels differ between the cached layer and direct \
+             drawing after a subpixel scroll; worst delta {} at ({}, {})",
+            worst.0, worst.1, worst.2
         );
     }
 }
