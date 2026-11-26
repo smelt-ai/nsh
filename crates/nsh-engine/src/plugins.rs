@@ -432,12 +432,12 @@ impl Plugins {
         }
     }
 
-    pub(crate) fn run_frame(&mut self) {
+    pub(crate) fn run_frame(&mut self, at: Instant) {
         for tenant in self.tenants() {
             if let Some(vm) = self.vms.get_mut(&tenant)
                 && vm.script.wants_frame()
             {
-                vm.run_charged(Script::run_frame);
+                vm.run_charged(|script| script.run_frame(at));
             }
         }
     }

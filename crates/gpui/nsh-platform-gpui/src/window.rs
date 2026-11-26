@@ -2239,8 +2239,10 @@ impl Element for WindowElement {
             std::mem::take(&mut dcx.drawn)
         };
         crate::surface::place_items(&w.placed, drawn);
-        if surface.wants_frames() || w.invalid.get() {
+        if surface.wants_immediate_frame() || w.invalid.get() {
             window.request_animation_frame();
+        } else {
+            surface.arm_pacer();
         }
         {
             let _in = enter(&surface, Some(w.id));

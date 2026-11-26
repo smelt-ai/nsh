@@ -165,7 +165,7 @@ fn message_label(message: &Message) -> &'static str {
         Message::PressBeyondRoot(..) => "press_beyond_root",
         Message::PressOnNative(..) => "press_on_native",
         Message::ScreenHeader(..) => "screen_header",
-        Message::Frame => "frame",
+        Message::Frame(_) => "frame",
         Message::States(..) => "states",
         Message::ReleaseStates(..) => "release_states",
         Message::Modality(..) => "modality",
@@ -1643,7 +1643,8 @@ enum Message {
     /// A press on a view's native content ([`EngineControl::press_on_native`]).
     PressOnNative(NodeId, nsh_core::Point<Points>),
     ScreenHeader(NodeId, Option<Points>),
-    Frame,
+    /// A display frame began at this time ([`EngineControl::frame_at`]).
+    Frame(Instant),
     States(NodeId, u16),
     ReleaseStates(NodeId, u16, std::time::Duration),
     Modality(nsh_core::platform::InputModality),
@@ -1910,10 +1911,20 @@ impl EngineControl {
         let _ = self.tx.send(Message::Chunk(Err((id, message))));
     }
 
-    /// A display frame began, after [`MountSink::request_frame`]: runs the
-    /// `requestAnimationFrame` callbacks and the tasks waiting for it.
+    /// A display frame began now, after [`MountSink::request_frame`]: runs
+    /// the `requestAnimationFrame` callbacks and the tasks waiting for it.
     pub fn frame(&self) {
-        let _ = self.tx.send(Message::Frame);
+        self.frame_at(nsh_core::time::now());
+    }
+
+    /// A display frame began at `at` (the host's frame time, on the system
+    /// clock), after [`MountSink::request_frame`]: the
+    /// `requestAnimationFrame` callbacks get it as their timestamp, all the
+    /// same, as a browser gives them its frame's time. Taken when the
+    /// engine gets to the frame, their timestamps would be as far apart as
+    /// the engine is busy, not as the frames are.
+    pub fn frame_at(&self, at: Instant) {
+        let _ = self.tx.send(Message::Frame(at));
     }
 
     /// Moves the engine's manual clock ([`EngineConfig::clock`]) forward
@@ -2272,7 +2283,7 @@ fn is_high_priority(message: &Message) -> bool {
             | Message::OverlayArea(..)
             | Message::PressBeyondRoot(..)
             | Message::PressOnNative(..)
-            | Message::Frame
+            | Message::Frame(_)
             | Message::States(..)
             | Message::ReleaseStates(..)
             | Message::Modality(..)
@@ -3227,12 +3238,17 @@ impl<M: TextEngine + 'static> Driver<M> {
             // A test's clock on a real platform: the display's frame moves it
             // to the frame's time first (a frame after the last, else now),
             // as a headless run's frames do.
-            Message::Frame if self.clock.moves_with_frames() => {
+            Message::Frame(_) if self.clock.moves_with_frames() => {
                 // The frame runs there, once, as the frames a move runs on
                 // the way do (whatever the messages handled meanwhile do).
                 self.state.frame_requested = true;
                 let by = self.next_frame() - self.clock.now();
                 self.advance(by, rx, true)
+            }
+            // A manual clock's frames are at its time, not the host's.
+            Message::Frame(_) if self.clock.is_manual() => {
+                let now = self.clock.now();
+                handle(self.script.as_ref(), &mut self.state, Message::Frame(now))
             }
             message => handle(self.script.as_ref(), &mut self.state, message),
         }
@@ -3342,7 +3358,8 @@ impl<M: TextEngine + 'static> Driver<M> {
     /// frames, now.
     fn frame(&mut self) {
         self.last_frame = Some(self.clock.now());
-        handle(self.script.as_ref(), &mut self.state, Message::Frame);
+        let now = self.clock.now();
+        handle(self.script.as_ref(), &mut self.state, Message::Frame(now));
     }
 
     /// Runs what the handled messages and the time made due, and submits
@@ -4910,16 +4927,16 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             press_outside(script, &mut state.core, &mut state.plugins, pressed);
         }
         Message::ScreenHeader(id, height) => state.core.set_screen_header(id, height),
-        Message::Frame => {
+        Message::Frame(at) => {
             state.frame_requested = false;
             state.frame_turn = true;
             state.frames_seen = true;
-            state.core.run_frame(nsh_core::time::now());
+            state.core.run_frame(at);
             if let Some(script) = script {
-                script.run_frame();
+                script.run_frame(at);
             }
             if !state.plugins.is_empty() {
-                state.plugins.run_frame();
+                state.plugins.run_frame(at);
             }
         }
         Message::States(id, states) => state.core.set_states(id, states),

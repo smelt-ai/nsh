@@ -1249,9 +1249,10 @@ impl Host {
     }
 
     /// Runs the `requestAnimationFrame` callbacks queued so far, with the
-    /// current `performance.now()`. Callbacks requested meanwhile wait for
-    /// the next frame.
-    pub fn run_frame(&self) {
+    /// frame's time `at` on `performance.now()`'s scale, as a browser gives
+    /// them its frame's time. Callbacks requested meanwhile wait for the
+    /// next frame.
+    pub fn run_frame(&self, at: Instant) {
         self.guarded(Phase::Call, || {
             let callbacks = std::mem::take(&mut *self.shared.frames.borrow_mut());
             if callbacks.is_empty() {
@@ -1263,6 +1264,12 @@ impl Host {
                     performance.get::<_, Function>("now")?.call(())
                 })()
                 .unwrap_or(0.0);
+                // `at` on `performance.now()`'s scale (the engine's own on a
+                // manual clock, QuickJS' else): as long before now as it was.
+                let clock = nsh_core::time::now();
+                let before = clock.saturating_duration_since(at).as_secs_f64()
+                    - at.saturating_duration_since(clock).as_secs_f64();
+                let now = now - before * 1000.0;
                 for (_, callback) in callbacks {
                     let result = callback.restore(&cx).and_then(|f| f.call::<_, ()>((now,)));
                     self.report(&cx, result);
@@ -2252,7 +2259,7 @@ const report = (v) => text(String(v));
         host.run_jobs();
         host.run_system();
         host.run_posted();
-        host.run_frame();
+        host.run_frame(nsh_core::time::now());
         host.collect_garbage();
         host.set_stop_flag(Arc::new(AtomicBool::new(false)));
         host.take_chunk_requests(&mut Vec::new());
@@ -2953,7 +2960,7 @@ const report = (v) => text(String(v));
             "#,
         )
         .unwrap();
-        host.run_frame();
+        host.run_frame(nsh_core::time::now());
         while let Some(next) = host.next_timer() {
             std::thread::sleep(next.saturating_duration_since(Instant::now()));
             host.run_timers(Instant::now());

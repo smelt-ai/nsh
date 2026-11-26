@@ -984,8 +984,8 @@ impl Element for SurfaceElement {
         // Animations tick on the window's frames while they run (and stop
         // asking when idle); a change made while painting (a frame client
         // added, an item placed) is drawn in the next frame, as no entry
-        // point flushes after a paint.
-        let requested = surface.wants_frames() || surface.invalidated();
+        // point flushes after a paint. What is paced comes from the pacer.
+        let requested = surface.frame_drawn();
         if requested {
             window.request_animation_frame();
         }

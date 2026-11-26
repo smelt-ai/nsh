@@ -1123,6 +1123,10 @@ pub(crate) fn window_visibility(surface: &Rc<Surface>, visible: bool) {
         view.changed();
     }
     blink::update();
+    // The pacer stopped while it was hidden ([`Surface::ensure_ticking`]).
+    if visible {
+        surface.ensure_ticking();
+    }
 }
 
 /// The surface with `key` stopped (its app or its view went): its focus

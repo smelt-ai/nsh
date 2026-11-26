@@ -329,6 +329,33 @@ fn a_clock_that_moves_with_frames_runs_them_at_the_display_pace() {
     assert_eq!(shown(&rx, &mut last), "60 frames, the last at 1000");
 }
 
+const FRAME_TIMES: &str = r#"import { mount, signal, Text } from "nsh";
+
+const apart = signal("no frames");
+let last = -1;
+const loop = (time) => {
+  if (last >= 0) apart.set(`${Math.round(time - last)} ms apart`);
+  last = time;
+  requestAnimationFrame(loop);
+};
+requestAnimationFrame(loop);
+mount(() => <Text>{apart()}</Text>);
+"#;
+
+#[test]
+fn frames_give_their_callbacks_the_host_s_frame_time() {
+    let (engine, rx) = start_app("nsh-clock-frame-time", FRAME_TIMES, Clock::system(), None);
+    let mut last = String::new();
+    flush(&engine);
+    // Sent at once, run when the engine gets to them: their callbacks still
+    // see them as far apart as the host's frames were.
+    let at = std::time::Instant::now() + Duration::from_secs(1);
+    engine.control().frame_at(at);
+    engine.control().frame_at(at + Duration::from_millis(40));
+    flush(&engine);
+    assert_eq!(shown(&rx, &mut last), "40 ms apart");
+}
+
 /// A Rust root with nothing to wake the engine after its first frame.
 #[component]
 fn Still() -> impl IntoElement {

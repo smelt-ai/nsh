@@ -313,7 +313,9 @@ impl Script {
     pub(crate) fn wants_frame(&self) -> bool {
         self.0.wants_frame()
     }
-    pub(crate) fn run_frame(&self) {
+    /// A browser host's callbacks run on the browser's own frames, with
+    /// their time.
+    pub(crate) fn run_frame(&self, _: Instant) {
         self.0.run_frame();
     }
     pub(crate) fn set_environment(&self, value: &Environment) {

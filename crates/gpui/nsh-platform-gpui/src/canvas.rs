@@ -68,7 +68,10 @@ use std::{
     cell::RefCell,
     f64::consts::{PI, TAU},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use gpui::{Font, FontStyle, Hsla, RenderImage, TextRun, WindowTextSystem, px};
@@ -126,6 +129,9 @@ pub(crate) struct CanvasState {
     /// What was rasterized (made while drawing, which only sees the
     /// state).
     cache: RefCell<Option<Recorded>>,
+    /// Drawn since its last drawing came, and how ([`Shown`]): a new drawing
+    /// is rasterized straight away for it, not on a frame of its own.
+    shown: RefCell<Option<Shown>>,
     /// What animated value changes moved since it was rasterized (view
     /// coordinates): only that is rasterized again.
     damage: std::cell::Cell<Option<Damage>>,
@@ -138,6 +144,9 @@ pub(crate) struct CanvasState {
     version: u64,
     /// The version a worker rasterizes now.
     inflight: std::cell::Cell<Option<u64>>,
+    /// A worker panicked rasterizing this version ([`failed`]): it is not
+    /// asked for again, as it would again; the next one is.
+    failed: std::cell::Cell<Option<u64>>,
 }
 
 impl CanvasState {
@@ -204,7 +213,7 @@ impl CanvasState {
     /// time, as drawings that change on every frame would queue a job a
     /// frame, the workers falling behind and showing frames ever older.
     fn ask(&self) -> Option<u64> {
-        if self.inflight.get().is_some() {
+        if self.inflight.get().is_some() || self.failed.get() == Some(self.version) {
             return None;
         }
         self.inflight.set(Some(self.version));
@@ -217,6 +226,13 @@ impl CanvasState {
         if self.inflight.get() == Some(version) {
             self.inflight.set(None);
         }
+    }
+
+    /// A worker panicked rasterizing `version`: what was rasterized before
+    /// keeps showing until a new version comes.
+    fn failed(&self, version: u64) {
+        self.landed(version);
+        self.failed.set(Some(version));
     }
 
     /// True when this canvas has no pending async rasterization, partial damage,
@@ -295,6 +311,17 @@ struct Key {
     size: (f32, f32),
 }
 
+/// How a canvas was last drawn: what a worker needs to rasterize a new
+/// drawing for the same place without a frame first.
+struct Shown {
+    surface: u64,
+    system: Arc<gpui::TextSystem>,
+    key: Key,
+    region: IRect,
+    frac: (f32, f32),
+    opacity: f32,
+}
+
 /// A part of a rasterized drawing.
 enum Layer {
     /// Pixels, and the tiles they are uploaded in (made when first
@@ -356,9 +383,36 @@ pub(crate) fn set(surface: &Rc<Surface>, view: &NshView, drawing: Arc<Drawing>) 
                 load.push(image.uri.clone());
             }
         }
-        c.drawing = Some(drawing);
+        c.drawing = Some(drawing.clone());
         c.stale();
     }
+    // Drawn since its last drawing: a worker rasterizes the new one for the
+    // same place now and its landing draws it ([`deliver`]), instead of a
+    // frame that only shows the last one while asking for it. A canvas
+    // redrawn on every tick of an animation otherwise costs two frames a
+    // tick. One in flight: its landing asks for the latest.
+    let eager = {
+        let state = view.state();
+        state.canvas.as_ref().and_then(|c| {
+            let shown = c.shown.borrow_mut().take()?;
+            if !load.is_empty() || c.images.values().any(Option::is_none) {
+                return None;
+            }
+            Some(c.ask().map(|version| Job {
+                surface: shown.surface,
+                id: state.id,
+                drawing: drawing.clone(),
+                args: c.args.clone(),
+                images: c.images.clone(),
+                system: shown.system,
+                key: shown.key,
+                region: shown.region,
+                frac: shown.frac,
+                version,
+                opacity: shown.opacity,
+            }))
+        })
+    };
     let text =
         |op: &CanvasOp| matches!(op, CanvasOp::FillText { .. } | CanvasOp::StrokeText { .. });
     if view
@@ -401,7 +455,14 @@ pub(crate) fn set(surface: &Rc<Surface>, view: &NshView, drawing: Arc<Drawing>) 
             view.changed();
         });
     }
-    view.changed();
+    match eager {
+        Some(job) => {
+            if let Some(job) = job {
+                spawn(job);
+            }
+        }
+        None => view.changed(),
+    }
 }
 
 /// Updates a frame's animated value slots, drawing again if they changed.
@@ -647,6 +708,14 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, view: &NshView, state: &ViewState) {
             }
         }
     }
+    *canvas.shown.borrow_mut() = Some(Shown {
+        surface: SURFACE.get(),
+        system: cx.app.text_system().clone(),
+        key,
+        region,
+        frac,
+        opacity: cx.opacity,
+    });
     if canvas.is_cacheable() != was_cacheable {
         view.clear_cache_info();
     }
@@ -721,7 +790,18 @@ fn spawn(job: Job) {
                 .spawn(move || {
                     crate::text::init_thread();
                     for job in rx {
-                        rasterize(job);
+                        let (surface, id, version) = (job.surface, job.id, job.version);
+                        // A panic would take the worker with it and leave the
+                        // job in flight for good: the canvas would never ask
+                        // for another, and its surface's landings would wait
+                        // for it ([`landed`]).
+                        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            rasterize(job);
+                        }));
+                        if run.is_err() {
+                            log::error!("canvas {id}: rasterizing version {version} panicked");
+                            crate::rt::invoke(move || failed(surface, id, version));
+                        }
                     }
                 });
             if let Err(e) = spawned {
@@ -730,7 +810,12 @@ fn spawn(job: Job) {
         }
         tx
     });
-    let _ = tx.send(job);
+    let surface = job.surface;
+    if tx.send(job).is_ok() {
+        sent(surface);
+    } else {
+        log::error!("canvas threads gone");
+    }
 }
 
 /// Rasterizes and uploads `job` (a worker), handing it to its canvas.
@@ -780,15 +865,161 @@ fn rasterize(job: Job) {
     });
 }
 
+/// The longest a canvas that landed waits for the others in flight on its
+/// surface (ms): a paced frame ([`crate::surface::PACED_HZ`]), so a slow
+/// one does not hold the rest back by more than that.
+fn landing_wait_ms() -> u64 {
+    (crate::surface::paced_period(crate::surface::PACED_HZ) * 1000.0).ceil() as u64
+}
+
+/// A surface's canvases rasterizing and landed ([`spawn`], [`deliver`]).
+#[derive(Default)]
+struct Landings {
+    /// Jobs sent and not landed yet.
+    inflight: u32,
+    /// Canvases landed and not drawn yet.
+    landed: Vec<nsh_core::NodeId>,
+    /// The timer that draws `landed` after [`landing_wait_ms`]: one drawing
+    /// them before it fires leaves it nothing, and the next batch a timer
+    /// of its own, which it does not cut short.
+    timer: Option<u64>,
+}
+
+thread_local! {
+    /// By surface key: canvases changed by one animation tick land on
+    /// their own, the workers taking turns; drawn as they land, a tick of
+    /// many canvases costs frames that each show part of it.
+    static LANDINGS: RefCell<FxHashMap<u64, Landings>> = RefCell::default();
+}
+
+/// A job for a canvas of `surface` was sent to a worker.
+fn sent(surface: u64) {
+    LANDINGS.with(|l| l.borrow_mut().entry(surface).or_default().inflight += 1);
+}
+
+/// Canvases of `surface` are being rasterized: their landing draws it
+/// ([`landed`]).
+pub(crate) fn rasterizing(surface: u64) -> bool {
+    LANDINGS.with(|l| l.borrow().get(&surface).is_some_and(|b| b.inflight > 0))
+}
+
+/// What a landing does next ([`Landings::land`]).
+#[derive(Debug, PartialEq)]
+enum Next {
+    /// None is in flight: draw the canvases landed.
+    Draw,
+    /// Others are in flight: the timer with this id draws them
+    /// ([`landing_wait_ms`]).
+    Wait(u64),
+    /// A timer is set already, or nothing is to be drawn.
+    Nothing,
+}
+
+impl Landings {
+    /// A job landed (`id` when its canvas is drawn again).
+    fn land(&mut self, id: Option<nsh_core::NodeId>) -> Next {
+        self.inflight = self.inflight.saturating_sub(1);
+        self.landed.extend(id);
+        if self.landed.is_empty() {
+            Next::Nothing
+        } else if self.inflight == 0 {
+            Next::Draw
+        } else if self.timer.is_none() {
+            static TIMERS: AtomicU64 = AtomicU64::new(0);
+            let timer = TIMERS.fetch_add(1, Ordering::Relaxed);
+            self.timer = Some(timer);
+            Next::Wait(timer)
+        } else {
+            Next::Nothing
+        }
+    }
+
+    /// The canvases landed, to draw now: all of them, or for `timer`, none
+    /// if they were drawn since it was set.
+    fn take(&mut self, timer: Option<u64>) -> Vec<nsh_core::NodeId> {
+        if timer.is_some() && timer != self.timer {
+            return Vec::new();
+        }
+        self.timer = None;
+        std::mem::take(&mut self.landed)
+    }
+
+    /// Nothing left to track.
+    fn done(&self) -> bool {
+        self.inflight == 0 && self.landed.is_empty() && self.timer.is_none()
+    }
+}
+
+/// A job of `surface` landed (`id` when its canvas is drawn again): the
+/// canvases landed are drawn once none is in flight, or after
+/// [`landing_wait_ms`].
+fn landed(surface: u64, id: Option<nsh_core::NodeId>) {
+    let next = LANDINGS.with(|l| {
+        let mut l = l.borrow_mut();
+        let batch = l.entry(surface).or_default();
+        let next = batch.land(id);
+        if batch.done() {
+            l.remove(&surface);
+        }
+        next
+    });
+    match next {
+        Next::Draw => draw_landed(surface, None),
+        Next::Wait(timer) => {
+            crate::rt::after_ms(landing_wait_ms(), move || draw_landed(surface, Some(timer)));
+        }
+        Next::Nothing => {}
+    }
+}
+
+/// Draws the canvases of `surface` landed so far ([`Landings::take`]).
+fn draw_landed(surface: u64, timer: Option<u64>) {
+    let landed = LANDINGS.with(|l| {
+        let mut l = l.borrow_mut();
+        let batch = l.get_mut(&surface)?;
+        let landed = batch.take(timer);
+        if batch.done() {
+            l.remove(&surface);
+        }
+        Some(landed)
+    });
+    let (Some(landed), Some(surface)) = (landed, Surface::by_key(surface)) else {
+        return;
+    };
+    for id in landed {
+        if let Some(view) = surface.view(id) {
+            view.changed();
+        }
+    }
+}
+
 /// A worker's rasterization of canvas `id` is done (main thread).
 fn deliver(surface: u64, id: nsh_core::NodeId, recorded: Recorded) {
+    let redraw = apply(surface, id, recorded);
+    landed(surface, redraw.then_some(id));
+}
+
+/// A worker panicked rasterizing `version` of canvas `id` of `surface`
+/// ([`spawn`]): it lands with nothing to draw.
+fn failed(surface: u64, id: nsh_core::NodeId, version: u64) {
+    if let Some(view) = Surface::by_key(surface).and_then(|s| s.view(id))
+        && let Some(canvas) = view.state().canvas.as_ref()
+    {
+        canvas.failed(version);
+    }
+    landed(surface, None);
+}
+
+/// Takes in a worker's rasterization of canvas `id`; true when it is to be
+/// drawn again.
+fn apply(surface: u64, id: nsh_core::NodeId, recorded: Recorded) -> bool {
     let Some(view) = Surface::by_key(surface).and_then(|s| s.view(id)) else {
-        return;
+        return false;
     };
     {
         let mut state = view.state_mut();
         let Some(c) = state.canvas.as_mut() else {
-            return;
+            return false;
         };
         c.landed(recorded.version);
         let newer = c
@@ -798,9 +1029,7 @@ fn deliver(surface: u64, id: nsh_core::NodeId, recorded: Recorded) {
             .is_none_or(|r| r.version < recorded.version);
         if !newer {
             // Drawn again to ask for the latest, if it is not this.
-            drop(state);
-            view.changed();
-            return;
+            return true;
         }
         // Values that moved while it was made: their areas are made again.
         if recorded.version == c.version
@@ -827,7 +1056,7 @@ fn deliver(surface: u64, id: nsh_core::NodeId, recorded: Recorded) {
         }
         *c.cache.get_mut() = Some(recorded);
     }
-    view.changed();
+    true
 }
 
 /// The rectangle to rasterize for `key` (device pixels from the pixel the
@@ -3307,6 +3536,51 @@ mod tests {
         (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
     }
 
+    #[test]
+    fn canvases_landing_while_others_are_in_flight_are_drawn_together() {
+        let id = |n: nsh_core::NodeId| n;
+        let mut batch = Landings::default();
+        batch.inflight = 3;
+        // The first to land waits for the rest, a timer bounding the wait.
+        let Next::Wait(stale) = batch.land(Some(id(1))) else {
+            panic!("no timer");
+        };
+        assert_eq!(batch.land(Some(id(2))), Next::Nothing);
+        // The last draws them all, once.
+        assert_eq!(batch.land(Some(id(3))), Next::Draw);
+        assert_eq!(batch.take(None), vec![id(1), id(2), id(3)]);
+        assert!(batch.done());
+
+        // The next batch waits for its own timer: the last one's, firing
+        // now, draws none of it.
+        batch.inflight = 2;
+        let Next::Wait(timer) = batch.land(Some(id(4))) else {
+            panic!("no timer");
+        };
+        assert_ne!(timer, stale);
+        assert!(batch.take(Some(stale)).is_empty());
+        assert_eq!(batch.land(Some(id(5))), Next::Draw);
+        assert_eq!(batch.take(None), vec![id(4), id(5)]);
+        assert!(batch.take(Some(timer)).is_empty());
+        assert!(batch.done());
+
+        // A slow one: the timer draws what landed, the slow one comes later.
+        batch.inflight = 2;
+        let Next::Wait(timer) = batch.land(Some(id(1))) else {
+            panic!("no timer");
+        };
+        assert_eq!(batch.take(Some(timer)), vec![id(1)]);
+        assert!(!batch.done());
+        assert_eq!(batch.land(Some(id(2))), Next::Draw);
+        assert_eq!(batch.take(None), vec![id(2)]);
+        assert!(batch.done());
+
+        // A landing not drawn again (its canvas gone) only counts.
+        batch.inflight = 1;
+        assert_eq!(batch.land(None), Next::Nothing);
+        assert!(batch.done());
+    }
+
     const IDENTITY: Affine = Affine {
         a: 1.0,
         b: 0.0,
@@ -3566,6 +3840,24 @@ mod tests {
         ]);
         assert_eq!(canvas.args[1], Some(batch_number(14.0)));
         assert_eq!(canvas.args[30], Some(batch_number(7.0)));
+    }
+
+    #[test]
+    fn a_version_a_worker_panicked_on_lands_and_is_not_asked_for_again() {
+        let mut canvas = CanvasState::default();
+        assert_eq!(canvas.ask(), Some(0));
+        canvas.failed(0);
+        assert_eq!(canvas.ask(), None);
+        // A new drawing is.
+        canvas.stale();
+        assert_eq!(canvas.ask(), Some(1));
+
+        // Its surface's landings do not wait for it.
+        let surface = u64::MAX;
+        sent(surface);
+        assert!(rasterizing(surface));
+        failed(surface, 1, 1);
+        assert!(!rasterizing(surface));
     }
 
     #[test]

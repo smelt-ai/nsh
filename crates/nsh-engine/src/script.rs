@@ -353,8 +353,8 @@ mod imp {
             self.host.wants_frame()
         }
 
-        pub(crate) fn run_frame(&self) {
-            self.host.run_frame();
+        pub(crate) fn run_frame(&self, at: Instant) {
+            self.host.run_frame(at);
         }
 
         pub(crate) fn set_environment(&self, environment: &Environment) {
@@ -534,7 +534,7 @@ mod stub {
             match *self {}
         }
 
-        pub(crate) fn run_frame(&self) {
+        pub(crate) fn run_frame(&self, _: Instant) {
             match *self {}
         }
 

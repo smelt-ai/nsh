@@ -120,6 +120,48 @@ impl MountSink for Sink {
 /// draws, its frames always come first.
 const LATE: f64 = 0.05;
 
+/// The rate (Hz) of what is drawn at a paced rate ([`Surface::pace`]) and
+/// asks for none of its own: animations looping with no end and JS frame
+/// loops running long ([`Surface::js_loop_paced`]).
+pub(crate) const PACED_HZ: f32 = 30.0;
+
+/// Animations asking for this rate (Hz) or more are drawn on the display's
+/// frames; below it, at their rate ([`Surface::pace`]).
+const DISPLAY_HZ: f32 = 60.0;
+
+/// A JS frame loop (`requestAnimationFrame` asked again frame after frame)
+/// running this long (seconds) is paced like an endless animation: short
+/// bursts (a spring, a JS transition) keep full rate.
+const JS_LOOP_PACE_AFTER: f64 = 1.0;
+
+/// A JS frame request coming this long (seconds) after the last run of the
+/// callbacks starts a new loop rather than continuing one.
+const JS_LOOP_GAP: f64 = 0.25;
+
+/// The surface stayed invalid this long (seconds) without being drawn: it is
+/// not presented (another dock tab, a hidden panel) and the pacer stops
+/// until it is drawn again.
+const NOT_PRESENTED_AFTER: f64 = 0.25;
+
+/// Seconds between paced frames at `hz`, rounded up to the microsecond: the
+/// pacer's frames come exactly this far apart ([`Surface::arm_pacer`]), and
+/// JS callbacks get their times, so a loop throttling itself to that rate
+/// (`time - last >= 1000 / 30`) never sees two of them closer.
+pub(crate) fn paced_period(hz: f32) -> f64 {
+    (1e6 / f64::from(hz)).ceil() / 1e6
+}
+
+/// How a surface's animations want frames ([`Surface::animation_pace`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AnimationPace {
+    /// None runs.
+    Still,
+    /// On the display's frames.
+    Display,
+    /// This many seconds apart ([`paced_period`]).
+    Paced(f64),
+}
+
 /// Called on every frame with the frame's time (seconds, [`Surface::clock`])
 /// until it is done ([`Surface::on_frame`]).
 pub(crate) type FrameClient = Box<dyn FnMut(&Rc<Surface>, f64) -> Next>;
@@ -221,6 +263,20 @@ pub(crate) struct Surface {
     pub(crate) appearance: Cell<nsh_core::platform::Appearance>,
     /// JS asked for a display frame.
     js_frame: Cell<bool>,
+    /// When the current unbroken JS frame loop first ran its callbacks.
+    js_loop_since: Cell<Option<f64>>,
+    /// When the JS frame callbacks last ran.
+    js_last_run: Cell<Option<f64>>,
+    /// When the surface last turned invalid ([`Surface::invalidate`]).
+    invalid_since: Cell<f64>,
+    /// The paced frame the pacer's timer waits for ([`Surface::arm_pacer`]).
+    pacer_armed: Cell<Option<f64>>,
+    /// The last paced frame's time, or the last run of the JS callbacks:
+    /// the next paced frame is a whole number of periods after it.
+    pacer_last: Cell<Option<f64>>,
+    /// A paced frame ran the JS callbacks and is drawn once their results
+    /// are in ([`Surface::frame_asked`]), not before.
+    pacer_owed: Cell<bool>,
     /// Extra frame clients (transitions, glides, spinners), called on every
     /// frame until they are done, each with its deadline ([`Next::At`]; a
     /// new one's is when it was added, [`Surface::on_frame`]).
@@ -343,6 +399,12 @@ impl Surface {
             environment: Cell::new(environment),
             appearance: Cell::default(),
             js_frame: Cell::new(false),
+            js_loop_since: Cell::new(None),
+            js_last_run: Cell::new(None),
+            invalid_since: Cell::new(0.0),
+            pacer_armed: Cell::new(None),
+            pacer_last: Cell::new(None),
+            pacer_owed: Cell::new(false),
             frame_clients: RefCell::default(),
             last_tick: Cell::new(f64::NEG_INFINITY),
             ticking: Cell::new(false),
@@ -520,6 +582,12 @@ impl Surface {
         crate::keymap::clear(self);
         crate::text_input::surface_stopped(self.key);
         self.js_frame.set(false);
+        self.js_loop_since.set(None);
+        self.js_last_run.set(None);
+        // The timer waiting finds another generation.
+        self.pacer_armed.set(None);
+        self.pacer_last.set(None);
+        self.pacer_owed.set(false);
         self.frame_clients.borrow_mut().clear();
         self.restep.set(false);
         // The timer waiting finds it no longer kept.
@@ -646,6 +714,7 @@ impl Surface {
     /// before it is): [`flush_all`] notifies its view.
     pub(crate) fn invalidate(&self) {
         if !self.invalid.replace(true) {
+            self.invalid_since.set(self.clock());
             // Entry points flush when they end; a change made anywhere else
             // (a GPUI callback, an observer) is flushed by the main-thread
             // queue, which flushes after its jobs: GPUI's retained frames
@@ -734,7 +803,7 @@ impl Surface {
                         f(&error);
                     }
                 }
-                Message::Frame => self.js_frame.set(true),
+                Message::Frame => self.frame_asked(),
                 Message::HotUpdateFailed => {
                     let handler = self.on_hot_update_failed.borrow().clone();
                     if let Some(f) = handler {
@@ -854,13 +923,205 @@ impl Surface {
             || !self.frame_clients.borrow().is_empty()
     }
 
+    /// The next frame is to come on the display's frames: a JS frame not
+    /// paced ([`Surface::js_loop_paced`]), a frame client, or an animation
+    /// drawn at the display's rate ([`Surface::animation_pace`]). Otherwise
+    /// what wants frames gets them from the pacer ([`Surface::pace`]).
+    pub(crate) fn wants_immediate_frame(&self) -> bool {
+        (self.js_frame.get() && !self.js_loop_paced())
+            || !self.frame_clients.borrow().is_empty()
+            || self.animation_pace() == AnimationPace::Display
+    }
+
+    /// How the running animations want frames: one that ends by itself and
+    /// asks for no rate, or one asking for [`DISPLAY_HZ`] or more, on the
+    /// display's frames; one asking for less at its rate; the rest (looping
+    /// with no end) at [`PACED_HZ`]. With several, the highest rate any asks
+    /// for ([`nsh_core::animation::Graph::frame_rate`]).
+    fn animation_pace(&self) -> AnimationPace {
+        let anim = self.anim.borrow();
+        if !anim.animating() {
+            return AnimationPace::Still;
+        }
+        match anim.frame_rate() {
+            Some(hz) if hz < DISPLAY_HZ => AnimationPace::Paced(paced_period(hz)),
+            Some(_) => AnimationPace::Display,
+            None if anim.finishing() => AnimationPace::Display,
+            None => AnimationPace::Paced(paced_period(PACED_HZ)),
+        }
+    }
+
+    /// Seconds between the paced frames wanted now, or none: nothing paced
+    /// runs, frames come on the display's anyway, or the window is hidden.
+    /// A paced JS loop waiting for its callbacks and paced animations share
+    /// the frames, at the higher rate either asks for.
+    fn pace(&self) -> Option<f64> {
+        if self.window_hidden.get() || self.wants_immediate_frame() {
+            return None;
+        }
+        let js = (self.js_frame.get() && self.js_loop_paced()).then(|| paced_period(PACED_HZ));
+        let anim = match self.animation_pace() {
+            AnimationPace::Paced(period) => Some(period),
+            _ => None,
+        };
+        js.into_iter().chain(anim).reduce(f64::min)
+    }
+
     /// Draws frames while animations run or JS wants a frame, and keeps
-    /// their deadlines while no frames come.
+    /// their deadlines while no frames come. What is paced is drawn by the
+    /// pacer only ([`Surface::arm_pacer`]): what the engine sends while it
+    /// runs draws a frame only if it changed something drawn.
     pub(crate) fn ensure_ticking(self: &Rc<Self>) {
-        if self.wants_frames() {
+        let immediate = self.wants_immediate_frame();
+        if immediate {
             self.invalidate();
+        }
+        if immediate || self.anim.borrow().animating() {
             self.keep_deadline();
         }
+        self.arm_pacer();
+    }
+
+    /// A frame of the surface was drawn: true when the next is to come on
+    /// the display's frames, else the pacer is armed for what is paced.
+    pub(crate) fn frame_drawn(self: &Rc<Self>) -> bool {
+        // The paced frame owed is this one.
+        self.pacer_owed.set(false);
+        if self.wants_immediate_frame() || self.invalidated() {
+            return true;
+        }
+        self.arm_pacer();
+        false
+    }
+
+    /// Arms the pacer's timer for the next paced frame, if any is wanted
+    /// ([`Surface::pace`]) and none is armed. Paced frames keep a cadence:
+    /// the next comes a whole number of periods after the last (or after
+    /// the JS callbacks last ran, on a frame), whenever the timer fires, so
+    /// timer delays add up to nothing and the JS callbacks see their frames
+    /// a period apart.
+    pub(crate) fn arm_pacer(self: &Rc<Self>) {
+        if self.pacer_armed.get().is_some() {
+            return;
+        }
+        let Some(period) = self.pace() else {
+            return;
+        };
+        let now = self.clock();
+        let at = match self.pacer_last.get() {
+            Some(last) if last <= now => last + period * (((now - last) / period).floor() + 1.0),
+            Some(last) => last + period,
+            None => now + period,
+        };
+        self.pacer_armed.set(Some(at));
+        let key = self.key;
+        let generation = self.generation.get();
+        crate::rt::after_ms(((at - now) * 1000.0).ceil() as u64, move || {
+            let Some(surface) = Surface::by_key(key) else {
+                return;
+            };
+            if surface.generation.get() == generation && surface.pacer_armed.get() == Some(at) {
+                surface.paced_frame(at);
+            }
+        });
+    }
+
+    /// The paced frame of time `at` came due. A paced JS loop waiting runs
+    /// its callbacks with `at` as their time, if the surface is presented
+    /// (what the last run changed was drawn); as they run in the engine,
+    /// what they change comes after, so the frame waits for it
+    /// ([`Surface::frame_asked`]) and shows the animations' step with it:
+    /// one frame where drawing first would make two. The JS loop draws no
+    /// frame of its own, so the pacer arms itself for it; paced animations
+    /// alone are drawn, and the frame drawn arms it ([`Surface::frame_drawn`]),
+    /// so a surface no longer drawn stops it.
+    fn paced_frame(self: &Rc<Self>, at: f64) {
+        self.pacer_armed.set(None);
+        self.pacer_last.set(Some(at));
+        // The last one's canvases have not all landed in a whole period
+        // ([`Surface::frame_asked`]), or the loop ended asking for nothing:
+        // the animations' step waits no longer.
+        if self.pacer_owed.replace(false) {
+            self.draw_paced();
+        }
+        if self.wants_immediate_frame() {
+            // A button went down: frames at the display's rate.
+            self.ensure_ticking();
+            return;
+        }
+        let animated = matches!(self.animation_pace(), AnimationPace::Paced(_));
+        if self.js_frame.get() && self.js_loop_paced() && self.presented(self.clock()) {
+            self.run_js_frame(at);
+            self.pacer_owed.set(animated);
+            self.arm_pacer();
+        } else if animated {
+            self.draw_paced();
+        }
+    }
+
+    /// The engine asks for a frame ([`MountSink::request_frame`]): JS
+    /// called `requestAnimationFrame`. Sent at the end of the engine's
+    /// turn, after its batch: the JS callbacks a paced frame ran are done
+    /// and what they changed is applied, so the frame owed is drawn now,
+    /// unless canvases they drew again are being rasterized, whose landing
+    /// draws it ([`crate::canvas`]).
+    fn frame_asked(self: &Rc<Self>) {
+        // Asked long after the last run: a new loop, not the last one
+        // going on.
+        let now = self.clock();
+        if self
+            .js_last_run
+            .get()
+            .is_none_or(|last| now - last > JS_LOOP_GAP)
+        {
+            self.js_loop_since.set(None);
+        }
+        self.js_frame.set(true);
+        if self.pacer_owed.get() && !crate::canvas::rasterizing(self.key) {
+            self.pacer_owed.set(false);
+            self.draw_paced();
+        }
+    }
+
+    /// Draws a paced frame: the surface and its windows of their own.
+    fn draw_paced(&self) {
+        self.invalidate();
+        crate::window::invalidate_all(self);
+    }
+
+    /// Whether the surface is presented: its window shows, and it was drawn
+    /// since it last changed, or not long ago ([`NOT_PRESENTED_AFTER`]).
+    fn presented(&self, now: f64) -> bool {
+        !self.window_hidden.get()
+            && !(self.invalid.get() && now - self.invalid_since.get() > NOT_PRESENTED_AFTER)
+    }
+
+    /// The JS frame loop running now has run long enough to be paced, and
+    /// no mouse button is held on the surface (a drag follows the pointer
+    /// at full rate). Browsers run `requestAnimationFrame` at the display's
+    /// rate but draw nothing for a callback that changed nothing; here the
+    /// callbacks run in the engine after the frame that asked for them, so
+    /// that frame never shows what they do: a loop at full rate is a whole
+    /// window drawn at full rate, whatever the loop throttles itself to.
+    fn js_loop_paced(&self) -> bool {
+        self.input_pressed.get() == 0
+            && self
+                .js_loop_since
+                .get()
+                .is_some_and(|since| self.clock() - since >= JS_LOOP_PACE_AFTER)
+    }
+
+    /// Runs the JS frame callbacks, with `at` as their time (on a frame, its
+    /// time; on a paced frame, the time it was paced by).
+    fn run_js_frame(&self, at: f64) {
+        self.js_frame.set(false);
+        if self.js_loop_since.get().is_none() {
+            self.js_loop_since.set(Some(at));
+        }
+        self.js_last_run.set(Some(at));
+        self.pacer_last.set(Some(at));
+        let time = self.epoch + std::time::Duration::from_secs_f64(at);
+        self.control(|c| c.frame_at(time));
     }
 
     /// One animation frame (called while the surface is drawn, before its
@@ -874,8 +1135,9 @@ impl Surface {
             self.anim.borrow_mut().tick(now);
             self.write_animations();
         }
-        if self.js_frame.replace(false) {
-            self.control(|c| c.frame());
+        // A paced loop's callbacks run on paced frames ([`Surface::paced_frame`]).
+        if self.js_frame.get() && !self.js_loop_paced() {
+            self.run_js_frame(now);
         }
         let clients = std::mem::take(&mut *self.frame_clients.borrow_mut());
         let mut kept: Vec<(FrameClient, Option<f64>)> = clients
@@ -1217,5 +1479,271 @@ pub(crate) mod tests {
         assert_eq!(*heard, [stopped]);
         assert!(heard[0].is_fatal());
         assert_eq!(heard[0].package.as_ref().map(|p| p.build), Some(7));
+    }
+
+    #[test]
+    fn endless_animations_and_long_js_loops_are_paced_while_the_rest_are_not() {
+        use nsh_core::animation::{AnimationOp, Composite, Driver, Easing};
+
+        let surface = Surface::new(nsh_engine::Environment::default());
+        assert!(!surface.wants_frames());
+        assert!(!surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), None);
+
+        // A JS frame request starting a loop is immediate.
+        surface.js_frame.set(true);
+        assert!(surface.wants_frames());
+        assert!(surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), None);
+
+        // A loop running past `JS_LOOP_PACE_AFTER` is paced: its callbacks
+        // run on the pacer's frames, at `PACED_HZ`.
+        let now = surface.clock();
+        surface
+            .js_loop_since
+            .set(Some(now - JS_LOOP_PACE_AFTER - 0.5));
+        assert!(surface.wants_frames());
+        assert!(!surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), Some(paced_period(PACED_HZ)));
+
+        // A button held on the surface: the loop follows at full rate.
+        surface.input_pressed.set(1);
+        assert!(surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), None);
+        surface.input_pressed.set(0);
+        surface.js_frame.set(false);
+        surface.js_loop_since.set(None);
+        surface.js_last_run.set(None);
+
+        // An endless loop asking for no rate is paced at `PACED_HZ`.
+        surface.apply(&MountBatch {
+            items: vec![
+                MountItem::Animation(AnimationOp::CreateValue {
+                    node: 1,
+                    value: 0.0,
+                }),
+                MountItem::Animation(AnimationOp::StartComposite {
+                    animation: 1,
+                    key: 1,
+                    spec: Composite::Loop {
+                        child: Box::new(Composite::Run {
+                            node: 1,
+                            driver: Driver::Timing {
+                                to: 360.0,
+                                duration_ms: 900.0,
+                                easing: Easing::Linear,
+                                delay_ms: 0.0,
+                                frame_rate: None,
+                            },
+                        }),
+                        iterations: None,
+                        reset: true,
+                    },
+                }),
+            ],
+        });
+        assert!(surface.wants_frames());
+        assert!(!surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), Some(paced_period(PACED_HZ)));
+        // With a paced JS loop too, one pace for both.
+        surface.js_frame.set(true);
+        surface
+            .js_loop_since
+            .set(Some(surface.clock() - JS_LOOP_PACE_AFTER - 0.5));
+        assert_eq!(surface.pace(), Some(paced_period(PACED_HZ)));
+        surface.js_frame.set(false);
+        surface.js_loop_since.set(None);
+
+        // A rate below `DISPLAY_HZ` asked for paces at it.
+        surface.apply(&MountBatch {
+            items: vec![
+                MountItem::Animation(AnimationOp::StopAnimation { animation: 1 }),
+                MountItem::Animation(AnimationOp::CreateValue {
+                    node: 2,
+                    value: 0.0,
+                }),
+                MountItem::Animation(AnimationOp::Start {
+                    node: 2,
+                    animation: 2,
+                    driver: Driver::Timing {
+                        to: 1.0,
+                        duration_ms: 200.0,
+                        easing: Easing::Linear,
+                        delay_ms: 0.0,
+                        frame_rate: Some(25.0),
+                    },
+                }),
+            ],
+        });
+        assert!(surface.wants_frames());
+        assert!(!surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), Some(0.04));
+
+        // A finite transition asking for no rate runs on the display's frames.
+        surface.apply(&MountBatch {
+            items: vec![
+                MountItem::Animation(AnimationOp::StopAnimation { animation: 2 }),
+                MountItem::Animation(AnimationOp::Start {
+                    node: 2,
+                    animation: 3,
+                    driver: Driver::Timing {
+                        to: 2.0,
+                        duration_ms: 200.0,
+                        easing: Easing::Linear,
+                        delay_ms: 0.0,
+                        frame_rate: None,
+                    },
+                }),
+            ],
+        });
+        assert!(surface.wants_frames());
+        assert!(surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), None);
+    }
+
+    /// `surface` runs a looping animation (`frame_rate` as it asks).
+    fn loop_animation(surface: &Rc<Surface>, frame_rate: Option<f32>) {
+        use nsh_core::animation::{AnimationOp, Composite, Driver, Easing};
+        surface.apply(&MountBatch {
+            items: vec![
+                MountItem::Animation(AnimationOp::CreateValue {
+                    node: 9,
+                    value: 0.0,
+                }),
+                MountItem::Animation(AnimationOp::StartComposite {
+                    animation: 9,
+                    key: 9,
+                    spec: Composite::Loop {
+                        child: Box::new(Composite::Run {
+                            node: 9,
+                            driver: Driver::Timing {
+                                to: 360.0,
+                                duration_ms: 900.0,
+                                easing: Easing::Linear,
+                                delay_ms: 0.0,
+                                frame_rate,
+                            },
+                        }),
+                        iterations: None,
+                        reset: true,
+                    },
+                }),
+            ],
+        });
+    }
+
+    #[test]
+    fn an_engine_message_draws_no_frame_for_a_paced_animation() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        loop_animation(&surface, None);
+        surface.invalid.set(false);
+        // Something the engine sends that changes nothing drawn: the
+        // looping animation's next frame is the pacer's, not this.
+        sent(&surface, vec![Message::Handled(1)]);
+        surface.drain();
+        assert!(!surface.invalidated());
+    }
+
+    /// `surface`'s JS frame loop has run long enough to be paced and asks
+    /// for its next frame.
+    fn paced_js_loop(surface: &Surface) {
+        let now = surface.clock();
+        surface.js_frame.set(true);
+        surface
+            .js_loop_since
+            .set(Some(now - JS_LOOP_PACE_AFTER - 0.5));
+        surface.js_last_run.set(Some(now));
+    }
+
+    #[test]
+    fn a_paced_js_loop_and_animation_draw_one_frame_a_period() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        loop_animation(&surface, None);
+        paced_js_loop(&surface);
+        surface.invalid.set(false);
+
+        // The paced frame runs the callbacks with its time and waits for
+        // what they do.
+        let at = surface.clock();
+        surface.paced_frame(at);
+        assert!(!surface.js_frame.get());
+        assert_eq!(surface.js_last_run.get(), Some(at));
+        assert!(!surface.invalidated());
+        // The engine's turn ends asking for the next: the frame is drawn
+        // now, the one frame of this period.
+        sent(&surface, vec![Message::Frame]);
+        surface.drain();
+        assert!(surface.invalidated());
+        surface.drawing();
+        assert!(!surface.frame_drawn());
+        // A frame drawn for anything else does not run the callbacks.
+        surface.tick();
+        assert!(surface.js_frame.get());
+        sent(&surface, vec![Message::Handled(1)]);
+        surface.drain();
+        assert!(!surface.invalidated());
+
+        // The loop ends asking for nothing: the next paced frame draws the
+        // step it held back.
+        surface.paced_frame(at + paced_period(PACED_HZ));
+        assert!(!surface.invalidated());
+        surface.paced_frame(at + 2.0 * paced_period(PACED_HZ));
+        assert!(surface.invalidated());
+    }
+
+    #[test]
+    fn paced_frames_keep_their_cadence() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        loop_animation(&surface, None);
+        let period = paced_period(PACED_HZ);
+        // One more microsecond than a 30th of a second: a loop skipping
+        // frames closer than `1000 / 30` ms never skips one.
+        assert_eq!(period, 0.033334);
+        assert!(period * 1000.0 >= 1000.0 / 30.0);
+
+        // The timer fired late: the next is still a whole number of periods
+        // after the last, not a period after it fired.
+        let before = surface.clock();
+        let last = before - 2.5 * period;
+        surface.pacer_last.set(Some(last));
+        assert!(!surface.frame_drawn());
+        let armed = surface.pacer_armed.get().unwrap();
+        let periods = (armed - last) / period;
+        assert!((periods - periods.round()).abs() < 1e-9, "{periods}");
+        assert!(armed > before && armed - period <= surface.clock());
+
+        // Hidden, none is armed.
+        surface.pacer_armed.set(None);
+        surface.window_hidden.set(true);
+        surface.ensure_ticking();
+        assert_eq!(surface.pacer_armed.get(), None);
+        surface.window_hidden.set(false);
+
+        // Not drawn for long: the JS loop waits and the pacer stops.
+        paced_js_loop(&surface);
+        surface.invalid.set(true);
+        surface
+            .invalid_since
+            .set(surface.clock() - NOT_PRESENTED_AFTER - 0.1);
+        surface.paced_frame(armed);
+        assert!(surface.js_frame.get());
+        assert_eq!(surface.pacer_armed.get(), None);
+    }
+
+    #[test]
+    fn an_endless_animation_asking_for_the_displays_rate_gets_it() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        loop_animation(&surface, Some(120.0));
+        assert!(surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), None);
+
+        let surface = Surface::new(nsh_engine::Environment::default());
+        loop_animation(&surface, Some(DISPLAY_HZ));
+        assert!(surface.wants_immediate_frame());
+
+        let surface = Surface::new(nsh_engine::Environment::default());
+        loop_animation(&surface, Some(20.0));
+        assert!(!surface.wants_immediate_frame());
+        assert_eq!(surface.pace(), Some(0.05));
     }
 }
