@@ -483,6 +483,7 @@ pub(crate) fn try_paint_cached_subtree(cx: &mut DrawCx<'_>, view: &NshView, worl
         subtree_layer_id(view.uid()),
         layer_bounds,
         revision,
+        None,
         |sub_cx| {
             crate::render::draw_view_uncached(sub_cx, view, world);
         },
@@ -680,6 +681,7 @@ fn flush_run(
         CachedLayerId::new(raw_id),
         layer_bounds,
         revision,
+        Some(run.len()),
         |sub_cx| {
             for entry in run.iter() {
                 crate::render::draw_view_uncached(sub_cx, entry.child, entry.world);
@@ -689,11 +691,79 @@ fn flush_run(
     run.clear();
 }
 
+/// `NSH_LAYER_CACHE_DEBUG=1`: every cached layer is outlined where it is
+/// composited ([`debug_outline`]) and every capture is logged to stderr, to
+/// tell stale cached content from what is drawn directly.
+fn debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSH_LAYER_CACHE_DEBUG").is_ok_and(|v| v != "0"))
+}
+
+/// The tile side GPUI's cached layers are rasterized in (device pixels,
+/// gpui-fast's `fast::layers::paint::TILE_SIZE`), for the debug grid.
+const DEBUG_TILE_SIZE: f32 = 512.0;
+
+/// Outlines cached layer `id` over `bounds` (window coordinates): a color of
+/// its own (the same from frame to frame), solid for a subtree and dashed
+/// for a sibling run, 3 px on a frame that captured it again and 1 px on a
+/// frame that reused it, with its tile grid in a fainter shade.
+fn debug_outline(
+    window: &mut gpui::Window,
+    id: CachedLayerId,
+    bounds: Bounds<Pixels>,
+    scale: f32,
+    run: bool,
+    captured: bool,
+) {
+    let mut hasher = FxHasher::default();
+    hasher.write_u64(id.as_u64());
+    let hue = (hasher.finish() % 360) as f32 / 360.0;
+    let color = gpui::hsla(hue, 0.9, 0.6, 1.0);
+    let grid = gpui::hsla(hue, 0.9, 0.6, 0.35);
+    let width = if captured { 3.0 } else { 1.0 };
+    let style = if run {
+        gpui::BorderStyle::Dashed
+    } else {
+        gpui::BorderStyle::Solid
+    };
+    window.paint_quad(gpui::quad(
+        bounds,
+        gpui::Corners::default(),
+        gpui::transparent_black(),
+        gpui::Edges::all(gpui::px(width)),
+        color,
+        style,
+    ));
+    // GPUI cuts tiles from the layer origin rounded to device pixels.
+    let left = f32::from(bounds.left());
+    let top = f32::from(bounds.top());
+    let right = f32::from(bounds.right());
+    let bottom = f32::from(bounds.bottom());
+    let step = DEBUG_TILE_SIZE / scale;
+    let mut x = (left * scale).round() / scale + step;
+    while x < right {
+        window.paint_quad(gpui::fill(
+            crate::render::bounds(x, top, 1.0, bottom - top),
+            grid,
+        ));
+        x += step;
+    }
+    let mut y = (top * scale).round() / scale + step;
+    while y < bottom {
+        window.paint_quad(gpui::fill(
+            crate::render::bounds(left, y, right - left, 1.0),
+            grid,
+        ));
+        y += step;
+    }
+}
+
 fn paint_with_layer(
     cx: &mut DrawCx<'_>,
     id: CachedLayerId,
     layer_bounds: Bounds<Pixels>,
     revision: u64,
+    run_members: Option<usize>,
     paint: impl FnOnce(&mut DrawCx<'_>),
 ) -> bool {
     let outer_clip = cx.clip;
@@ -729,6 +799,40 @@ fn paint_with_layer(
     if let (Some((paths, ms)), Some((sub_paths, sub_ms))) = (&mut cx.measured, sub_measured) {
         *paths += sub_paths;
         *ms += sub_ms;
+    }
+    if debug_enabled() {
+        let captured = ran.is_some();
+        if captured {
+            let kind = match run_members {
+                Some(n) => format!("run({n})"),
+                None => format!("subtree(uid {})", id.as_u64() >> 1),
+            };
+            eprintln!(
+                "[nsh-layer-cache] pass {paint_pass} capture {kind} id={:016x} rev={revision:016x} \
+                 bounds=({:.1},{:.1} {:.1}x{:.1}) clip=({:.1},{:.1} {:.1}x{:.1})",
+                id.as_u64(),
+                f32::from(layer_bounds.left()),
+                f32::from(layer_bounds.top()),
+                f32::from(layer_bounds.size.width),
+                f32::from(layer_bounds.size.height),
+                f32::from(outer_clip.left()),
+                f32::from(outer_clip.top()),
+                f32::from(outer_clip.size.width),
+                f32::from(outer_clip.size.height),
+            );
+        }
+        let scale = cx.scale;
+        cx.window
+            .with_content_mask(Some(ContentMask { bounds: outer_clip }), |window| {
+                debug_outline(
+                    window,
+                    id,
+                    layer_bounds,
+                    scale,
+                    run_members.is_some(),
+                    captured,
+                );
+            });
     }
     if ran.is_some() {
         cx.cache_misses += 1;
