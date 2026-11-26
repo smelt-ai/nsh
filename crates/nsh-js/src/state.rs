@@ -70,6 +70,8 @@ pub(crate) fn install(
     shared: Rc<Shared>,
     ui_sets: &[Registry],
     posts: nsh_core::element::Posts,
+    ids: crate::host::SharedIds,
+    guest: bool,
 ) {
     let raw = cx.as_raw().as_ptr();
     // SAFETY: registering classes on the context's runtime; the state is
@@ -77,19 +79,19 @@ pub(crate) fn install(
     unsafe {
         let rt = qjs::JS_GetRuntime(raw);
         let graph = crate::reactive::new_graph(raw);
-        let dom = Dom::new(raw, shared);
+        let dom = Dom::new(raw, shared, ids.clone(), guest);
         let state = Box::into_raw(Box::new(State {
             graph,
             dom,
             env: Env::default(),
             i18n: Default::default(),
-            components: Components::default(),
+            components: Components::new(ids.clone()),
             lists: Lists::default(),
             platform: Default::default(),
             menus: Default::default(),
             windows: Default::default(),
             touches: Default::default(),
-            animations: Default::default(),
+            animations: crate::animated::Animations::new(ids),
             canvases: Default::default(),
             web: Default::default(),
             classes: crate::classes::Classes::new(posts),

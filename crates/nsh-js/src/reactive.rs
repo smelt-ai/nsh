@@ -1429,7 +1429,14 @@ mod tests {
         let rt = Runtime::new().unwrap();
         let cx = Context::full(&rt).unwrap();
         cx.with(|cx| {
-            crate::state::install(&cx, std::rc::Rc::default(), &[], Default::default());
+            crate::state::install(
+                &cx,
+                std::rc::Rc::default(),
+                &[],
+                Default::default(),
+                Default::default(),
+                false,
+            );
             super::install_globals(&cx);
             let out: String = cx
                 .eval(format!(
@@ -1608,7 +1615,14 @@ mod tests {
             g.slots()
         };
         let before = cx.with(|cx| {
-            crate::state::install(&cx, std::rc::Rc::default(), &[], Default::default());
+            crate::state::install(
+                &cx,
+                std::rc::Rc::default(),
+                &[],
+                Default::default(),
+                Default::default(),
+                false,
+            );
             super::install_globals(&cx);
             let before = live(cx.as_raw().as_ptr()).0;
             let _: () = cx
@@ -1635,7 +1649,14 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let cx = rquickjs::Context::full(&rt).unwrap();
         cx.with(|cx| {
-            crate::state::install(&cx, std::rc::Rc::default(), &[], Default::default());
+            crate::state::install(
+                &cx,
+                std::rc::Rc::default(),
+                &[],
+                Default::default(),
+                Default::default(),
+                false,
+            );
             super::install_globals(&cx);
             let _: () = cx
                 .eval(

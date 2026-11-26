@@ -18,6 +18,7 @@ mod scrollbars;
 mod services;
 mod slots;
 mod sticky;
+mod tenant;
 mod terminal_layout;
 #[cfg(test)]
 mod tests;
@@ -41,7 +42,10 @@ use taffy::{AvailableSpace, NodeId as LayoutId, Overflow, Position};
 
 #[doc(hidden)]
 pub use self::components::set_part_requester;
-pub use self::measure::{ListScrollPosition, Measurement};
+pub use self::{
+    measure::{ListScrollPosition, Measurement},
+    tenant::{SHELL_TENANT, TenantId, guest_writes_root},
+};
 use self::{
     layout_tree::LayoutTree,
     list::{ExtraKind, Follow, ListState, PendingScroll, PinTarget},
@@ -73,6 +77,8 @@ struct Run {
     text: String,
     /// The block or span holding it; `NO_KEY` when it is not in the tree.
     block: Key,
+    /// Which tenant owns this run.
+    tenant: TenantId,
 }
 
 /// A view's built-in scroll bar (`scrollbars.rs`) and the theme of its own
@@ -625,6 +631,8 @@ impl std::ops::BitOrAssign for Positional {
 
 struct Node {
     id: NodeId,
+    /// Which JS VM tenant owns this node (`SHELL_TENANT` = 0 for shell / Rust).
+    tenant: TenantId,
     kind: Kind,
     /// Inside a text block: a nested `<text>` span or a raw text run.
     inline: bool,
@@ -1000,6 +1008,7 @@ impl Node {
     fn new(id: NodeId, kind: Kind) -> Self {
         Self {
             id,
+            tenant: SHELL_TENANT,
             kind,
             inline: false,
             parent: NO_KEY,
@@ -1289,6 +1298,8 @@ pub enum ApplyError {
     /// A new id far beyond the ids in use (ids index a table, so they must
     /// stay dense).
     IdOutOfRange(NodeId),
+    /// A guest tenant attempted to reference `ROOT_ID` or another tenant's node.
+    TenantViolation(NodeId),
 }
 
 impl ApplyError {
@@ -1297,7 +1308,10 @@ impl ApplyError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            ApplyError::TooManyNodes(_) | ApplyError::TooDeep(_) | ApplyError::IdOutOfRange(_)
+            ApplyError::TooManyNodes(_)
+                | ApplyError::TooDeep(_)
+                | ApplyError::IdOutOfRange(_)
+                | ApplyError::TenantViolation(_)
         )
     }
 }
@@ -1517,8 +1531,19 @@ pub struct Core<M: TextEngine> {
     /// ([`crate::element::ElementRef::focus_back_origin`]): one per
     /// trigger, its latest opening.
     focus_origins: Vec<(NodeId, Option<(Key, NodeId)>)>,
-    /// Animates the layout changes of the next commit.
+    /// Animates the layout changes of the next commit: the shell's, all
+    /// of them.
     layout_animation: Option<LayoutAnimation>,
+    /// The plugins' layout animations of the next commit, each animating
+    /// its own views (`layout_scope.rs`); the shell's replaces them.
+    guest_layout: Vec<(TenantId, LayoutAnimation)>,
+    /// The plugins' layout animations that lead this batch.
+    guest_layout_batch: Vec<(TenantId, LayoutAnimation)>,
+    /// The shell's layout animation leads this batch.
+    shell_layout_batch: bool,
+    /// The plugins' views deleted in this batch, with their tenant: a
+    /// deletion's view is gone when the batch is split.
+    guest_deleted: Vec<(NodeId, TenantId)>,
     /// Nodes whose change animates the frames it moves in the next commit,
     /// or their own frame alone when true (`layout_scope.rs`).
     scoped_layout: Vec<(NodeId, crate::LayoutTransition, bool)>,
@@ -1710,6 +1735,8 @@ pub struct Core<M: TextEngine> {
     overlays: Vec<Key>,
     /// What the shown overlays listen to.
     overlay_state: overlay::Overlays,
+    /// Multi-tenant ownership, per-tenant quotas and cross-tenant slots.
+    tenants: tenant::TenantState,
 }
 
 impl<M: TextEngine + 'static> Core<M> {
@@ -1850,6 +1877,10 @@ impl<M: TextEngine> Core<M> {
             focus_back: None,
             focus_origins: Vec::new(),
             layout_animation: None,
+            guest_layout: Vec::new(),
+            guest_layout_batch: Vec::new(),
+            shell_layout_batch: false,
+            guest_deleted: Vec::new(),
             scoped_layout: Vec::new(),
             resized: Vec::new(),
             restructured: Vec::new(),
@@ -1894,6 +1925,7 @@ impl<M: TextEngine> Core<M> {
             system_dark: false,
             overlays: Vec::new(),
             overlay_state: overlay::Overlays::default(),
+            tenants: tenant::TenantState::default(),
         }
     }
 
@@ -2828,6 +2860,8 @@ impl<M: TextEngine> Core<M> {
             Op::Create { id, tag } => self.create(id, tag),
             Op::CreateText { id, text } => {
                 let idx = id as usize;
+                let tenant = self.tenants.current;
+                self.tenants.check_quota(tenant)?;
                 if self.slots.contains(idx) || self.runs.contains_key(&id) {
                     return Err(ApplyError::DuplicateNode(id));
                 }
@@ -2836,11 +2870,13 @@ impl<M: TextEngine> Core<M> {
                     if self.nodes.len().saturating_add(self.runs.len()) >= self.max_nodes {
                         return Err(ApplyError::TooManyNodes(self.max_nodes));
                     }
+                    self.tenants.inc(tenant);
                     self.runs.insert(
                         id,
                         Run {
                             text,
                             block: NO_KEY,
+                            tenant,
                         },
                     );
                     self.admitted_id_extent = self.admitted_id_extent.max(idx.saturating_add(1));
@@ -2956,6 +2992,11 @@ impl<M: TextEngine> Core<M> {
                 Ok(())
             }
             Op::Release { id } => self.release(id),
+            Op::AttachSlot { name, child } => self.attach_slot(self.tenants.current, name, child),
+            Op::DetachSlot { child } => {
+                self.detach_slot(child);
+                Ok(())
+            }
             Op::Placeholder { id } => {
                 let key = self.key(id)?;
                 self.placeholder(key);
@@ -3017,11 +3058,19 @@ impl<M: TextEngine> Core<M> {
                 self.mark(key, flags);
                 Ok(())
             }
+            // A plugin's animates its own views (`layout_scope.rs`).
             Op::Command {
                 id: crate::ROOT_ID,
                 command: Command::LayoutAnimation(animation),
             } => {
-                self.layout_animation = Some(animation);
+                let tenant = self.tenants.current;
+                if tenant == SHELL_TENANT {
+                    self.layout_animation = Some(animation);
+                } else if let Some(g) = self.guest_layout.iter_mut().find(|g| g.0 == tenant) {
+                    g.1 = animation;
+                } else {
+                    self.guest_layout.push((tenant, animation));
+                }
                 Ok(())
             }
             // Sent to a node: the frames its change moves.
@@ -3080,6 +3129,20 @@ impl<M: TextEngine> Core<M> {
                 command: Command::MeasureScrollPosition { call },
             } if self.key(id).is_err() => {
                 self.answer_scroll_position(id, call);
+                Ok(())
+            }
+            // A plugin's context menu: its items report to it.
+            Op::Command {
+                id: crate::ROOT_ID,
+                command: Command::Desktop(mut desktop),
+            } if self.tenants.current != SHELL_TENANT
+                && matches!(*desktop, crate::desktop::DesktopCommand::PopupMenu { .. }) =>
+            {
+                if let crate::desktop::DesktopCommand::PopupMenu { items, .. } = &mut *desktop {
+                    *items = self.guest_menu_ids(self.tenants.current, items).into();
+                }
+                self.commands
+                    .push((crate::ROOT_ID, Command::Desktop(desktop)));
                 Ok(())
             }
             // A window's attributes go into its record, sent once per
@@ -3644,8 +3707,16 @@ impl<M: TextEngine> Core<M> {
         // in the batch; ops may already have queued some.
         self.sync_env();
         if let Some(animation) = self.layout_animation.take() {
+            self.guest_layout.clear();
+            self.guest_layout_batch.clear();
+            self.shell_layout_batch = true;
             self.note_list_motion(animation);
             self.mount.insert(0, MountItem::LayoutAnimation(animation));
+        } else if !self.guest_layout.is_empty() {
+            if let Some(lead) = self.lead_guest_layout() {
+                self.note_list_motion(lead);
+                self.mount.insert(0, MountItem::LayoutAnimation(lead));
+            }
         }
         self.flush_pointer_events();
         if !self.relators.is_empty() {
@@ -4084,6 +4155,8 @@ impl<M: TextEngine> Core<M> {
 
     fn alloc(&mut self, id: NodeId, kind: Kind) -> Result<Key, ApplyError> {
         let idx = id as usize;
+        let tenant = self.tenants.current;
+        self.tenants.check_quota(tenant)?;
         if self.nodes.len().saturating_add(self.runs.len()) >= self.max_nodes {
             return Err(ApplyError::TooManyNodes(self.max_nodes));
         }
@@ -4091,8 +4164,11 @@ impl<M: TextEngine> Core<M> {
         if self.slots.contains(idx) || self.runs.contains_key(&id) {
             return Err(ApplyError::DuplicateNode(id));
         }
-        let key = self.nodes.insert(Node::new(id, kind)) as Key;
+        let mut node = Node::new(id, kind);
+        node.tenant = tenant;
+        let key = self.nodes.insert(node) as Key;
         self.insert_key(idx, key);
+        self.tenants.inc(tenant);
         Ok(key)
     }
 
@@ -6780,6 +6856,10 @@ impl<M: TextEngine> Core<M> {
                     flags |= dirty::VIEW_PROPS;
                 }
             }
+            Prop::SlotTarget(name) => {
+                self.set_slot_target(id, name);
+                return Ok(());
+            }
             Prop::Modal(prop) => {
                 if let Some(root) = node.root.as_mut() {
                     let c = &mut root.modal;
@@ -7163,9 +7243,15 @@ impl<M: TextEngine> Core<M> {
         let Some(run) = self.runs.remove(&id) else {
             return Ok(());
         };
-        let key = match self.alloc(id, Kind::RawText) {
+        let prev = self.tenants.current;
+        self.tenants.current = run.tenant;
+        self.tenants.dec(run.tenant);
+        let allocated = self.alloc(id, Kind::RawText);
+        self.tenants.current = prev;
+        let key = match allocated {
             Ok(key) => key,
             Err(e) => {
+                self.tenants.inc(run.tenant);
                 self.runs.insert(id, run);
                 return Err(e);
             }
@@ -7566,6 +7652,7 @@ impl<M: TextEngine> Core<M> {
 
     fn release(&mut self, id: NodeId) -> Result<(), ApplyError> {
         if let Some(run) = self.runs.remove(&id) {
+            self.tenants.dec(run.tenant);
             if run.block != NO_KEY {
                 self.folded.remove(&run.block);
                 self.mark_text_block(run.block);
@@ -7584,6 +7671,7 @@ impl<M: TextEngine> Core<M> {
         if key == self.root {
             return Ok(());
         }
+        self.before_node_released(id);
         // What the core made for its `tooltip` goes first, out of it.
         if !self.overlay_state.tooltips.is_empty() {
             self.tooltip_released(id);
@@ -7607,6 +7695,7 @@ impl<M: TextEngine> Core<M> {
             self.parent_lists.retain(|&k| k != key);
         }
         let node = self.nodes.remove(key as usize);
+        self.tenants.dec(node.tenant);
         self.ch_readers -= usize::from(node.reads_ch);
         self.slots.remove(id as usize);
         if node.class_props.as_ref().and_then(|c| c.pointer_events)
@@ -7674,6 +7763,9 @@ impl<M: TextEngine> Core<M> {
             self.layout.remove(layout);
         }
         if node.created {
+            if node.tenant != SHELL_TENANT {
+                self.guest_deleted.push((id, node.tenant));
+            }
             self.mount.push(MountItem::Delete { id });
         }
         Ok(())

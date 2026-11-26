@@ -198,6 +198,14 @@ const NSH: &[Item] = &[
         ),
     ),
     (
+        "mountSlot",
+        Export::Function(dom::mount_slot, 3),
+        Ts::function(
+            "Renders `app` into the container declaring `slotTarget={name}`; returns a function that removes it.",
+            &["<P extends object>(name: string, app: Component<P>, props?: P): () => void"],
+        ),
+    ),
+    (
         "split",
         Export::Function(dom::split, 2),
         Ts::function(

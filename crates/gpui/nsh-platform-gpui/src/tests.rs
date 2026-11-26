@@ -317,6 +317,8 @@ fn windows(cx: &mut TestAppContext) {
     a_secondary_click_on_a_drag_area_reaches_its_on_context_menu(cx);
     props_and_commands_reach_a_native_component_whose_view_is_not_drawn(cx);
     a_command_without_a_search_field_takes_the_keyboard_on_focus(cx);
+    // SMELT: guest plugin VMs share `crate::rt`.
+    crate::plugin_tests::guest_plugins(cx);
 }
 
 /// These cases exercise window state or attributes through `currentWindow()`.

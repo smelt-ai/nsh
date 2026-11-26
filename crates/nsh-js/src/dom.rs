@@ -69,8 +69,13 @@ pub(crate) struct InlineRoot;
 pub(crate) struct Dom {
     shared: Rc<Shared>,
     classes: Classes,
-    /// The next id JS gives a node (even: the core gives odd ones).
-    next_id: Cell<NodeId>,
+    /// Shared dense ID allocator across VMs sharing a single [`nsh_core::Core`].
+    ids: crate::host::SharedIds,
+    /// Guest plugin VM: mounts into named slots via `mountSlot`, never mutates `ROOT`.
+    guest: bool,
+    /// Active wrapper nodes created by `mountSlot` (owned, keeps slot roots alive
+    /// even if the caller drops the dispose callback).
+    slot_mounts: RefCell<FxHashMap<NodeId, JsValue>>,
     /// Live nodes by `id >> 1` (the root is 0); weak: a node's object owns
     /// its data.
     nodes: RefCell<nsh_core::id_table::IdTable<*mut NodeData>>,
@@ -278,7 +283,12 @@ pub(crate) fn with_str<R>(cx: *mut JsContext, v: JsValue, f: impl FnOnce(&str) -
 }
 
 impl Dom {
-    pub(crate) fn new(raw: *mut JsContext, shared: Rc<Shared>) -> Dom {
+    pub(crate) fn new(
+        raw: *mut JsContext,
+        shared: Rc<Shared>,
+        ids: crate::host::SharedIds,
+        guest: bool,
+    ) -> Dom {
         // SAFETY: registering classes on the context's runtime.
         let classes = unsafe {
             let rt = qjs::JS_GetRuntime(raw);
@@ -336,7 +346,9 @@ impl Dom {
         Dom {
             shared,
             classes,
-            next_id: Cell::new(2),
+            ids,
+            guest,
+            slot_mounts: RefCell::new(FxHashMap::default()),
             nodes: RefCell::new(nsh_core::id_table::IdTable::new()),
             root: Cell::new(UNDEFINED),
             inline_root: nsh_core::element::engine_context::<InlineRoot>().is_some(),
@@ -355,8 +367,12 @@ impl Dom {
 
     /// Frees the values the renderer holds (the state is unregistered).
     pub(crate) fn free_all(&mut self, raw: *mut JsContext) {
-        // SAFETY: the renderer's own value; no JS runs from here on.
+        // SAFETY: the renderer's own values; no JS runs from here on.
         unsafe { qjs::JS_FreeValue(raw, self.root.replace(UNDEFINED)) };
+        for (_, v) in self.slot_mounts.borrow_mut().drain() {
+            // SAFETY: slot root values the renderer owned.
+            unsafe { qjs::JS_FreeValue(raw, v) };
+        }
         for (_, v) in self.dismissed.take() {
             // SAFETY: values the renderer owned.
             unsafe { qjs::JS_FreeValue(raw, v) };
@@ -390,6 +406,9 @@ impl Dom {
     }
 
     fn send_direction(&self) {
+        if self.guest {
+            return;
+        }
         let rtl = self.env_rtl.get();
         self.rtl.set(Some(rtl));
         self.shared.ops.borrow_mut().push(Op::SetProp {
@@ -398,8 +417,18 @@ impl Dom {
         });
     }
 
-    /// Queues `op`; `Err` (with a thrown error) over the VM's limit.
+    /// Queues `op`; `Err` (with a thrown error) over the VM's limit, or
+    /// for a plugin's write to the root (only the app's VM writes there).
     fn push(&self, cx: *mut JsContext, op: Op) -> Result<(), JsValue> {
+        if self.guest && nsh_core::guest_writes_root(&op) {
+            // SAFETY: throws on a live context.
+            return Err(unsafe {
+                qjs::JS_ThrowTypeError(
+                    cx,
+                    c"a plugin cannot change what belongs to the whole window (the app's shortcuts, menus, theme or windows): only the app does".as_ptr(),
+                )
+            });
+        }
         let mut ops = self.shared.ops.borrow_mut();
         if ops.len() >= self.shared.limits.max_op_values {
             drop(ops);
@@ -879,6 +908,11 @@ pub(crate) fn root_value(cx: *mut JsContext) -> JsValue {
     dom(cx).root.get()
 }
 
+/// Whether this VM runs as a sandboxed guest plugin (does not own `ROOT_ID`).
+pub(crate) fn is_guest(cx: *mut JsContext) -> bool {
+    dom(cx).guest
+}
+
 /// Queues `op` (for the components' glue).
 pub(crate) fn push_op(cx: *mut JsContext, op: Op) -> Result<(), JsValue> {
     dom(cx).push(cx, op)
@@ -1023,10 +1057,7 @@ pub(crate) fn insert_node(
 const MAX_DISMISSED: usize = 16;
 
 fn next_id(cx: *mut JsContext) -> NodeId {
-    let d = dom(cx);
-    let id = d.next_id.get();
-    d.next_id.set(id + 2);
-    id
+    dom(cx).ids.next_node()
 }
 
 unsafe extern "C" fn node_finalize(rt: *mut qjs::JSRuntime, obj: JsValue) {
@@ -1675,7 +1706,10 @@ fn set_event(
         (None, None) => (false, None),
     };
     let now = handler.is_some();
-    let pushed = if was != now {
+    // A plugin hears the root's events the engine sends it (its context
+    // menus') without the root listening for it: only the app's VM writes
+    // there.
+    let pushed = if was != now && !(id == ROOT && dom(cx).guest) {
         dom(cx).push(
             cx,
             Op::Listen {
@@ -3631,6 +3665,12 @@ pub(crate) unsafe extern "C" fn mount(
     argv: *mut JsValue,
 ) -> JsValue {
     let d = dom(cx);
+    if d.guest {
+        return throw_type(
+            cx,
+            "nsh: guest plugins must use mountSlot(name, App, props) instead of mount()",
+        );
+    }
     if d.rtl.get().is_none() {
         d.send_direction();
     }
@@ -3768,6 +3808,138 @@ unsafe extern "C" fn unmount(
     result
 }
 
+/// `mountSlot(name, App, props)`: renders `App` inside a VM-owned wrapper view
+/// and attaches it to the container carrying `slotTarget={name}`; returns a
+/// dispose function that tears down the mounted subtree and detaches it.
+pub(crate) unsafe extern "C" fn mount_slot(
+    cx: *mut JsContext,
+    _this: JsValue,
+    argc: c_int,
+    argv: *mut JsValue,
+) -> JsValue {
+    let (name_arg, app, props) = (arg(argc, argv, 0), arg(argc, argv, 1), arg(argc, argv, 2));
+    // SAFETY: inline tag check on borrowed JS argument.
+    let name = match unsafe { qjs::JS_IsString(name_arg) }
+        .then(|| string_arg(cx, name_arg))
+        .flatten()
+        .filter(|s| !s.is_empty())
+    {
+        Some(name) => name,
+        None => return throw_type(cx, "nsh: mountSlot expects a non-empty slot name string"),
+    };
+    let holder = match create_element(cx, Tag::View) {
+        Ok(holder) => holder,
+        Err(e) => return e,
+    };
+    let Some(holder_id) = node_id(cx, holder) else {
+        // SAFETY: `holder` is owned.
+        unsafe { qjs::JS_FreeValue(cx, holder) };
+        return throw_type(cx, "nsh: mountSlot failed to allocate wrapper view");
+    };
+    // Let the internal slot wrapper fill flex/fixed slot containers (`flex_grow: 1`, `flex_shrink: 1`)
+    // while keeping `flex_basis: auto` so intrinsic-sized slots still size to their content.
+    let mut holder_style = nsh_core::Style::default();
+    holder_style.layout.flex_grow = 1.0;
+    holder_style.layout.flex_shrink = 1.0;
+    if let Err(e) = push_op(
+        cx,
+        Op::SetStyle {
+            id: holder_id,
+            style: Box::new(holder_style),
+            patch: nsh_core::StylePatch::default(),
+        },
+    ) {
+        // SAFETY: frees the unmounted holder when op quota trips.
+        unsafe { qjs::JS_FreeValue(cx, holder) };
+        return e;
+    }
+    let (owner, result) = reactive::with_root(cx, || {
+        // SAFETY: creating/duplicating JS values on a live context.
+        let props = if unsafe { qjs::JS_IsObject(props) } {
+            unsafe { qjs::JS_DupValue(cx, props) }
+        } else {
+            unsafe { qjs::JS_NewObject(cx) }
+        };
+        let mut args = [props];
+        let out = reactive::untracked_with(cx, || unsafe {
+            qjs::JS_Call(cx, app, UNDEFINED, 1, args.as_mut_ptr())
+        });
+        unsafe { qjs::JS_FreeValue(cx, props) };
+        if unsafe { qjs::JS_IsException(out) } {
+            return Err(out);
+        }
+        let r = insert_value(cx, holder, out, None);
+        unsafe { qjs::JS_FreeValue(cx, out) };
+        r
+    });
+    if let Err(e) = result {
+        // SAFETY: frees the unmounted holder on render error.
+        unsafe { qjs::JS_FreeValue(cx, holder) };
+        reactive::dispose_owner(cx, owner);
+        return e;
+    }
+    if let Err(e) = push_op(
+        cx,
+        Op::AttachSlot {
+            name: std::sync::Arc::from(name),
+            child: holder_id,
+        },
+    ) {
+        // SAFETY: frees the unattached holder when op quota trips.
+        unsafe { qjs::JS_FreeValue(cx, holder) };
+        reactive::dispose_owner(cx, owner);
+        return e;
+    }
+    dom(cx).slot_mounts.borrow_mut().insert(holder_id, holder);
+    let mut data = [
+        qjs::JS_NewFloat64(owner as f64),
+        qjs::JS_NewFloat64(holder_id as f64),
+    ];
+    // SAFETY: numeric data values do not need freeing.
+    let dispose =
+        unsafe { qjs::JS_NewCFunctionData(cx, Some(unmount_slot), 0, 0, 2, data.as_mut_ptr()) };
+    reactive::finish_value(cx, dispose)
+}
+
+unsafe extern "C" fn unmount_slot(
+    cx: *mut JsContext,
+    _this: JsValue,
+    _argc: c_int,
+    _argv: *mut JsValue,
+    _magic: c_int,
+    data: *mut JsValue,
+) -> JsValue {
+    // SAFETY: two numeric data values set by `mount_slot`.
+    let (owner_v, holder_v) = unsafe { (*data, *data.add(1)) };
+    let (mut owner_id, mut holder_id) = (0f64, 0f64);
+    unsafe {
+        qjs::JS_ToFloat64(cx, &mut owner_id, owner_v);
+        qjs::JS_ToFloat64(cx, &mut holder_id, holder_v);
+    }
+    let holder_id = holder_id as NodeId;
+    let Some(holder) = dom(cx).slot_mounts.borrow_mut().remove(&holder_id) else {
+        return UNDEFINED;
+    };
+    reactive::dispose_owner(cx, owner_id as u32);
+    // SAFETY: `holder` is a live node owned by `slot_mounts`.
+    let current: Vec<JsValue> = unsafe { &(*node_ptr(cx, holder)).children }
+        .iter()
+        .map(|&v| unsafe { qjs::JS_DupValue(cx, v) })
+        .collect();
+    let mut result = UNDEFINED;
+    for &c in &current {
+        if let Err(e) = remove_child(cx, holder, c) {
+            result = e;
+            break;
+        }
+    }
+    free_values(cx, current);
+    let _ = push_op(cx, Op::DetachSlot { child: holder_id });
+    // SAFETY: releases the renderer's last reference to `holder`.
+    unsafe { qjs::JS_FreeValue(cx, holder) };
+    result
+}
+
 /// `setup(tailwind, theme, appearance, statusBar, app)`: the app's Tailwind
 /// theme and the theme of the Rust components (JSON strings, or null), its
 /// appearance (`"light"` / `"dark"`, or null), the status bar's default
@@ -3785,6 +3957,11 @@ unsafe extern "C" fn setup(
         && let Some(json) = string_arg(cx, app)
     {
         crate::env::set_app_info(cx, &json);
+    }
+    // Guest plugin VMs inherit the shell's theme, status bar and appearance
+    // rather than mutating `ROOT_ID` during bundler prologue setup.
+    if dom(cx).guest {
+        return UNDEFINED;
     }
     let root = dom(cx).root.get();
     for (i, name) in ["tailwindTheme", "uiTheme"].into_iter().enumerate() {
@@ -3806,10 +3983,10 @@ unsafe extern "C" fn setup(
         crate::env::take_theme(cx, &json);
     }
     // What this runtime cannot read (a newer NSH's) is left out.
-    let status_bar = arg(argc, argv, 3);
+    let status_bar_arg = arg(argc, argv, 3);
     // SAFETY: an inline tag check.
-    let status_bar = (unsafe { qjs::JS_IsString(status_bar) })
-        .then(|| string_arg(cx, status_bar))
+    let status_bar = (unsafe { qjs::JS_IsString(status_bar_arg) })
+        .then(|| string_arg(cx, status_bar_arg))
         .flatten()
         .and_then(|json| serde_json::from_str(&json).ok())
         .map(|v| nsh_core::StatusBarSetting::from_json(&v));

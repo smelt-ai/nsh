@@ -55,6 +55,8 @@ pub struct AppError {
     pub stack: Option<String>,
     /// The signed package the app came from, if it did.
     pub package: Option<Arc<PackageInfo>>,
+    /// The guest plugin id this error originated from (`None` for the shell app).
+    pub plugin: Option<String>,
 }
 
 impl AppError {
@@ -67,12 +69,19 @@ impl AppError {
             message: message.to_owned(),
             stack: stack.map(str::to_owned),
             package: None,
+            plugin: None,
         }
     }
 
     /// Sets the package the app came from.
     pub fn with_package(mut self, package: Option<Arc<PackageInfo>>) -> AppError {
         self.package = package;
+        self
+    }
+
+    /// Tags this error with the guest plugin id that produced it.
+    pub fn with_plugin(mut self, plugin: Option<String>) -> AppError {
+        self.plugin = plugin;
         self
     }
 
@@ -156,10 +165,16 @@ mod tests {
         for (kind, fatal, stopped) in kinds {
             let error = AppError::new(kind, "x");
             assert_eq!(
-                (error.is_fatal(), error.is_stopped()),
-                (fatal, stopped),
+                (
+                    error.is_fatal(),
+                    error.is_stopped(),
+                    error.plugin.as_deref()
+                ),
+                (fatal, stopped, None),
                 "{kind:?}"
             );
+            let tagged = error.with_plugin(Some("buddies".into()));
+            assert_eq!(tagged.plugin.as_deref(), Some("buddies"));
         }
     }
 }

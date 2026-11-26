@@ -71,7 +71,9 @@ pub use crate::{
     },
     declarations::type_definitions,
     error::JsError,
-    host::{ErrorHandler, Host, HostOptions, LineExtentMeasurer, TextMeasurer},
+    host::{
+        ErrorHandler, Host, HostOptions, LineExtentMeasurer, SharedIds, TextMeasurer,
+    },
     net::{FetchEvent, FetchOp, HttpBody, HttpHead, HttpRequest, NetworkQueue, RequestId},
 };
 

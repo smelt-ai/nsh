@@ -26,8 +26,16 @@
 //! A view that follows another one (`follow.rs`) moving to another element
 //! scopes its own frame alone (and its subtree's): what changes around it
 //! in that commit is not its doing.
+//!
+//! A plugin's layout animation at the root (`LayoutAnimation.configureNext`
+//! in a guest VM, `tenant.rs`) animates the plugin's own views, all of
+//! their changes: frames, insertions and removals, as the shell's animates
+//! every view. The other tenants' views change as they would without it.
+//! It leads the batch as the shell's would, so lists move their rows
+//! under it (`list_motion.rs`); then each animated item takes its owner's
+//! animation, or none. The shell's replaces the plugins' in its batch.
 
-use super::{Core, Key, NO_KEY};
+use super::{Core, Key, NO_KEY, tenant::TenantId};
 use crate::{LayoutAnimation, LayoutTransition, MountItem, NodeId, text::TextEngine};
 
 /// A node whose change animates the frames it moves, with `transition`.
@@ -70,21 +78,53 @@ impl<M: TextEngine> Core<M> {
         }
     }
 
-    /// Leads each run of frames in the batch with the layout animation it
-    /// takes: a scope's for the frames its node moves, an empty one for
-    /// the others. Nothing while no scope waits, or when the batch animates
-    /// all of its layout already.
+    /// The plugins' layout animations of the next commit join this
+    /// batch's, unless the shell's leads it: what leads the batch, all of
+    /// their phases (each item takes its owner's in
+    /// [`Core::split_scoped_frames`]).
+    pub(super) fn lead_guest_layout(&mut self) -> Option<LayoutAnimation> {
+        if self.shell_layout_batch {
+            self.guest_layout.clear();
+            return None;
+        }
+        for (tenant, animation) in self.guest_layout.drain(..) {
+            match self.guest_layout_batch.iter_mut().find(|g| g.0 == tenant) {
+                Some(g) => g.1 = animation,
+                None => self.guest_layout_batch.push((tenant, animation)),
+            }
+        }
+        let lead = self
+            .guest_layout_batch
+            .iter()
+            .fold(LayoutAnimation::default(), |a, &(_, g)| LayoutAnimation {
+                create: a.create.or(g.create),
+                update: a.update.or(g.update),
+                delete: a.delete.or(g.delete),
+            });
+        Some(lead)
+    }
+
+    /// Leads each run of animated items in the batch with the layout
+    /// animation it takes: a plugin's for its own views, a scope's for the
+    /// frames its node moves, an empty one for the others. Nothing while
+    /// neither waits, or when the shell animates all of the batch's layout.
     pub(super) fn split_scoped_frames(&mut self) {
-        if self.scoped_layout.is_empty() {
+        let guests = std::mem::take(&mut self.guest_layout_batch);
+        let mut deleted = std::mem::take(&mut self.guest_deleted);
+        self.shell_layout_batch = false;
+        if self.scoped_layout.is_empty() && guests.is_empty() {
+            deleted.clear();
+            self.guest_deleted = deleted;
             return;
         }
         let requested = std::mem::take(&mut self.scoped_layout);
         let mut resized = std::mem::take(&mut self.resized);
         let mut restructured = std::mem::take(&mut self.restructured);
-        if self
-            .mount
-            .iter()
-            .any(|m| matches!(m, MountItem::LayoutAnimation(_)))
+        if guests.is_empty()
+            && self
+                .mount
+                .iter()
+                .any(|m| matches!(m, MountItem::LayoutAnimation(_)))
         {
             resized.clear();
             self.resized = resized;
@@ -123,35 +163,86 @@ impl<M: TextEngine> Core<M> {
         resized.retain(|k| restructured.binary_search(k).is_err());
         resized.sort_unstable();
         resized.dedup();
-        if !scopes.is_empty() {
+        if !scopes.is_empty() || !guests.is_empty() {
             let items = std::mem::take(&mut self.mount);
             let mut out = Vec::with_capacity(items.len() + 2);
-            // What the platform animates the next frame with.
-            let mut current = None;
+            // What the batch animates the next item with, before the
+            // split: the plugins' lead, or none where a list's rows change
+            // at once (`list_motion.rs`).
+            let mut lead = LayoutAnimation::default();
+            // What the platform animates the next item with.
+            let mut current = LayoutAnimation::default();
             for item in items {
-                if let MountItem::Frame { id, .. } = item {
-                    let wanted = self.key(id).ok().and_then(|key| {
-                        scopes
-                            .iter()
-                            .find(|s| self.moves(s, key, &resized))
-                            .map(|s| s.transition)
-                    });
-                    if wanted != current {
-                        out.push(MountItem::LayoutAnimation(LayoutAnimation {
-                            update: wanted,
-                            ..LayoutAnimation::default()
-                        }));
-                        current = wanted;
+                let wanted = match item {
+                    MountItem::LayoutAnimation(a) => {
+                        lead = a;
+                        continue;
                     }
+                    MountItem::Frame { id, .. } => {
+                        let guest = self.guest_layout_of(&guests, &deleted, id, lead);
+                        Some(guest.unwrap_or_else(|| LayoutAnimation {
+                            update: self.key(id).ok().and_then(|key| {
+                                scopes
+                                    .iter()
+                                    .find(|s| self.moves(s, key, &resized))
+                                    .map(|s| s.transition)
+                            }),
+                            ..LayoutAnimation::default()
+                        }))
+                    }
+                    MountItem::Insert { child: id, .. }
+                    | MountItem::Remove { id }
+                    | MountItem::Delete { id }
+                        if !guests.is_empty() =>
+                    {
+                        Some(
+                            self.guest_layout_of(&guests, &deleted, id, lead)
+                                .unwrap_or_default(),
+                        )
+                    }
+                    _ => None,
+                };
+                if let Some(wanted) = wanted
+                    && wanted != current
+                {
+                    out.push(MountItem::LayoutAnimation(wanted));
+                    current = wanted;
                 }
                 out.push(item);
             }
             self.mount = out;
         }
+        deleted.clear();
+        self.guest_deleted = deleted;
         resized.clear();
         self.resized = resized;
         restructured.clear();
         self.restructured = restructured;
+    }
+
+    /// The layout animation of view `id` when it is a plugin's that
+    /// animates its own (none where the batch's `lead` changes it at once);
+    /// `None` when it is not.
+    fn guest_layout_of(
+        &self,
+        guests: &[(TenantId, LayoutAnimation)],
+        deleted: &[(NodeId, TenantId)],
+        id: NodeId,
+        lead: LayoutAnimation,
+    ) -> Option<LayoutAnimation> {
+        if guests.is_empty() {
+            return None;
+        }
+        let tenant = deleted
+            .iter()
+            .find(|d| d.0 == id)
+            .map_or_else(|| self.node_tenant(id), |d| d.1);
+        let &(_, animation) = guests.iter().find(|g| g.0 == tenant)?;
+        Some(if lead == LayoutAnimation::default() {
+            lead
+        } else {
+            animation
+        })
     }
 
     /// Whether `scope`'s change moves the frame of `key`: `key` is in its

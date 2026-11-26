@@ -6547,6 +6547,221 @@ fn layout_animation_leads_the_batch() {
     );
 }
 
+/// What each animated item of `batch` (a frame, an insertion, a removal)
+/// animates with: `(item, node, the layout animation before it)`.
+fn animated_items(batch: &MountBatch) -> Vec<(&'static str, NodeId, crate::LayoutAnimation)> {
+    let mut current = crate::LayoutAnimation::default();
+    let mut out = Vec::new();
+    for item in &batch.items {
+        match *item {
+            MountItem::LayoutAnimation(a) => current = a,
+            MountItem::Frame { id, .. } => out.push(("frame", id, current)),
+            MountItem::Insert { child, .. } => out.push(("insert", child, current)),
+            MountItem::Remove { id } => out.push(("remove", id, current)),
+            MountItem::Delete { id } => out.push(("delete", id, current)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A plugin's `LayoutAnimation.configureNext` (a guest's layout animation
+/// at the root) animates its own views, their frames, insertions and
+/// removals; the other tenants' views change at once.
+#[test]
+fn a_guest_layout_animation_animates_its_own_views() {
+    let mut c = core();
+    let shell = |c: &mut Core<FakeEngine>, op| c.apply_as(SHELL_TENANT, op).unwrap();
+    let guest = |c: &mut Core<FakeEngine>, op| c.apply_as(1, op).unwrap();
+    // The shell's slot (2) and a view after it (4).
+    for id in [2, 4] {
+        shell(&mut c, Op::Create { id, tag: Tag::View });
+        shell(
+            &mut c,
+            style_op(id, &[("height", StyleValue::Number(40.0))]),
+        );
+        shell(
+            &mut c,
+            Op::Insert {
+                parent: 1,
+                child: id,
+                before: None,
+            },
+        );
+    }
+    shell(
+        &mut c,
+        Op::SetProp {
+            id: 2,
+            prop: Prop::SlotTarget(Some("p".into())),
+        },
+    );
+    // The plugin's view (6) in the slot, with 8 and 10 in it.
+    guest(
+        &mut c,
+        Op::Create {
+            id: 6,
+            tag: Tag::View,
+        },
+    );
+    guest(
+        &mut c,
+        Op::AttachSlot {
+            name: "p".into(),
+            child: 6,
+        },
+    );
+    for id in [8, 10] {
+        guest(&mut c, Op::Create { id, tag: Tag::View });
+        guest(
+            &mut c,
+            style_op(id, &[("height", StyleValue::Number(10.0))]),
+        );
+        guest(
+            &mut c,
+            Op::Insert {
+                parent: 6,
+                child: id,
+                before: None,
+            },
+        );
+    }
+    c.commit().unwrap();
+
+    guest(
+        &mut c,
+        Op::Command {
+            id: ROOT_ID,
+            command: Command::LayoutAnimation(crate::LayoutAnimation::EASE_IN_EASE_OUT),
+        },
+    );
+    guest(&mut c, style_op(8, &[("height", StyleValue::Number(20.0))]));
+    guest(
+        &mut c,
+        Op::Remove {
+            parent: 6,
+            child: 10,
+        },
+    );
+    guest(
+        &mut c,
+        Op::Create {
+            id: 12,
+            tag: Tag::View,
+        },
+    );
+    guest(
+        &mut c,
+        Op::Insert {
+            parent: 6,
+            child: 12,
+            before: None,
+        },
+    );
+    guest(&mut c, Op::Release { id: 10 });
+    shell(&mut c, style_op(4, &[("height", StyleValue::Number(60.0))]));
+    let batch = c.commit().unwrap();
+    let items = animated_items(&batch);
+    let with = |kind: &str, id: NodeId| {
+        items
+            .iter()
+            .find(|i| i.0 == kind && i.1 == id)
+            .unwrap_or_else(|| panic!("no {kind} of {id}: {items:?}"))
+            .2
+    };
+    let ease = crate::LayoutAnimation::EASE_IN_EASE_OUT;
+    assert_eq!(with("frame", 8), ease);
+    assert_eq!(with("insert", 12), ease);
+    assert_eq!(with("remove", 10), ease);
+    assert_eq!(with("delete", 10), ease);
+    assert_eq!(with("frame", 4), crate::LayoutAnimation::default());
+}
+
+/// The shell's layout animation at the root animates every view, the
+/// plugins' too.
+#[test]
+fn the_shell_layout_animation_animates_every_view() {
+    let mut c = core();
+    let shell = |c: &mut Core<FakeEngine>, op| c.apply_as(SHELL_TENANT, op).unwrap();
+    let guest = |c: &mut Core<FakeEngine>, op| c.apply_as(1, op).unwrap();
+    shell(
+        &mut c,
+        Op::Create {
+            id: 2,
+            tag: Tag::View,
+        },
+    );
+    shell(
+        &mut c,
+        Op::Insert {
+            parent: 1,
+            child: 2,
+            before: None,
+        },
+    );
+    shell(
+        &mut c,
+        Op::SetProp {
+            id: 2,
+            prop: Prop::SlotTarget(Some("p".into())),
+        },
+    );
+    guest(
+        &mut c,
+        Op::Create {
+            id: 6,
+            tag: Tag::View,
+        },
+    );
+    guest(
+        &mut c,
+        Op::AttachSlot {
+            name: "p".into(),
+            child: 6,
+        },
+    );
+    c.commit().unwrap();
+
+    let spring = crate::LayoutAnimation::SPRING;
+    // A plugin's in the same commit gives way to the shell's.
+    guest(
+        &mut c,
+        Op::Command {
+            id: ROOT_ID,
+            command: Command::LayoutAnimation(crate::LayoutAnimation::EASE_IN_EASE_OUT),
+        },
+    );
+    shell(
+        &mut c,
+        Op::Command {
+            id: ROOT_ID,
+            command: Command::LayoutAnimation(spring),
+        },
+    );
+    guest(&mut c, style_op(6, &[("height", StyleValue::Number(20.0))]));
+    shell(
+        &mut c,
+        Op::Create {
+            id: 4,
+            tag: Tag::View,
+        },
+    );
+    shell(
+        &mut c,
+        Op::Insert {
+            parent: 1,
+            child: 4,
+            before: None,
+        },
+    );
+    let batch = c.commit().unwrap();
+    let items = animated_items(&batch);
+    for (kind, id) in [("frame", 6), ("insert", 4)] {
+        let item = items.iter().find(|i| i.0 == kind && i.1 == id);
+        assert_eq!(item.map(|i| i.2), Some(spring), "{kind} of {id}: {items:?}");
+    }
+}
+
 /// A region (2) over a view after it (4) and a fixed board (6) whose row
 /// (8) changes too: what each frame item of `batch` animates with.
 fn scoped_layout_commit(root_too: bool) -> Vec<(NodeId, Option<crate::LayoutTransition>)> {
@@ -54102,7 +54317,8 @@ fn node_record_sizes() {
     // #1345: the per-node records the core keeps for every node.
     let node = std::mem::size_of::<super::Node>();
     eprintln!("Node {node} B");
-    assert!(node <= 600, "Node grew to {node} bytes");
+    // Smelt fork adds `Node::tenant: TenantId` (+8 B alignment over upstream's 600 B cap).
+    assert!(node <= 608, "Node grew to {node} bytes");
 }
 
 #[test]

@@ -24,6 +24,16 @@ pub(crate) struct SystemConfig {
     /// come near (`EngineConfig::content_culling`).
     #[cfg_attr(not(feature = "js-core"), allow(dead_code))]
     pub(crate) lazy_rows: bool,
+    /// Shared dense ID counters for VMs sharing one [`nsh_core::Core`].
+    #[cfg(feature = "js-core")]
+    pub(crate) shared_ids: Option<nsh_js::SharedIds>,
+    /// True for sandboxed guest plugin VMs (mounts via `mountSlot`, trips fuse
+    /// permanently on CPU budget overrun).
+    #[cfg(feature = "js-core")]
+    pub(crate) guest: bool,
+    /// Guest plugin id attached to [`AppError::plugin`] (`None` for shell app).
+    #[cfg(feature = "js-core")]
+    pub(crate) plugin_id: Option<String>,
 }
 
 #[cfg(not(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32"))))]
@@ -70,6 +80,8 @@ mod imp {
         stop: Arc<AtomicBool>,
         /// The package the bundle came from, named in its errors.
         package: Option<Arc<PackageInfo>>,
+        /// Guest plugin id tagged on [`AppError::plugin`] (`None` for shell app).
+        plugin: Option<String>,
         /// Told of fatal errors ([`Bundle::trial`]).
         trial: Option<Arc<dyn crate::Trial>>,
     }
@@ -96,19 +108,25 @@ mod imp {
             sink: Rc<dyn MountSink>,
             system: super::SystemConfig,
         ) -> Option<(Script, u128)> {
+            let guest = system.guest;
+            let plugin_id = system.plugin_id;
             let options = HostOptions {
                 limits,
                 harden: bundle.policy.harden,
                 ui_sets: ui_sets.to_vec(),
                 posts,
                 base_url: bundle.base_url.as_deref().map(str::to_owned),
+                shared_ids: system.shared_ids,
+                guest,
+                stop_on_budget_trip: guest,
             };
             let mut host = match Host::with_options(options) {
                 Ok(host) => host,
                 Err(err) => {
                     log::error!("failed to start JS: {err}");
                     let error = AppError::new(AppErrorKind::Load, &err.message)
-                        .with_package(bundle.package.clone());
+                        .with_package(bundle.package.clone())
+                        .with_plugin(plugin_id);
                     if let Some(trial) = &bundle.trial {
                         trial.failed(&error);
                     }
@@ -133,6 +151,7 @@ mod imp {
             let symbolicator = Rc::new(RefCell::new(Symbolicator::new(bundle.source_map.clone())));
             let (map, errors, stopping) = (symbolicator.clone(), sink.clone(), stop.clone());
             let package = bundle.package.clone();
+            let err_plugin = plugin_id.clone();
             host.set_error_handler(Box::new(move |err| {
                 if stopping.load(Ordering::Relaxed) {
                     return;
@@ -140,7 +159,9 @@ mod imp {
                 let message = map.borrow_mut().rewrite(&err.message);
                 log::error!(target: "js", "uncaught exception: {message}");
                 errors.report(
-                    &AppError::new(AppErrorKind::Uncaught, &message).with_package(package.clone()),
+                    &AppError::new(AppErrorKind::Uncaught, &message)
+                        .with_package(package.clone())
+                        .with_plugin(err_plugin.clone()),
                 );
             }));
             // Unhandled rejections are logged only, as browsers do: the
@@ -171,6 +192,7 @@ mod imp {
                 symbolicator,
                 stop,
                 package: bundle.package.clone(),
+                plugin: plugin_id,
                 trial: bundle.trial.clone(),
             };
             // The chunks that come with the bundle: the entry may import
@@ -184,7 +206,18 @@ mod imp {
                 BundleCode::Source(code) => script.host.eval_source(code),
             };
             if let Err(err) = loaded {
-                script.report(&*sink, AppErrorKind::Load, "bundle failed", &err.message);
+                if guest {
+                    // Fatal VM stops (OOM, CPU load budget) are reported as
+                    // `AppErrorKind::Stopped` by `plugins::load_plugin`; normal
+                    // top-level JS throws report `Load` and abort startup so no
+                    // half-initialized guest VM remains resident.
+                    if script.fatal().is_none() {
+                        script.report(&*sink, AppErrorKind::Load, "bundle failed", &err.message);
+                        return None;
+                    }
+                } else {
+                    script.report(&*sink, AppErrorKind::Load, "bundle failed", &err.message);
+                }
             }
             let eval_us = start.elapsed().as_micros();
             Some((script, eval_us))
@@ -203,7 +236,9 @@ mod imp {
             }
             let message = self.symbolicator.borrow_mut().rewrite(message);
             log::error!(target: "js", "{what}: {message}");
-            let error = AppError::new(kind, &message).with_package(self.package.clone());
+            let error = AppError::new(kind, &message)
+                .with_package(self.package.clone())
+                .with_plugin(self.plugin.clone());
             if let Some(trial) = &self.trial
                 && error.is_fatal()
             {

@@ -3754,6 +3754,10 @@ pub enum Prop {
     /// `watchScroll`.
     #[prop(js = "nativeID")]
     NativeId(Option<Box<str>>),
+    /// `slotTarget`: names a container view that guest plugin VMs may mount
+    /// isolated subtrees into (`mountSlot(name, ...)`).
+    #[prop(js = "slotTarget")]
+    SlotTarget(Option<Box<str>>),
     /// The highlight of an input's or a selectable text's selection (Rust
     /// components; TS sets the `selectionColor` style key or
     /// `selection:bg-*`).
@@ -4304,6 +4308,19 @@ pub enum Op {
     /// posted during a synchronous call ([`crate::element::RustCall`]). Never
     /// reaches a platform.
     Rust(crate::element::RustOp),
+    /// Attaches guest wrapper node `child` into the view carrying
+    /// `slotTarget = name` (or queues it until such a view mounts).
+    AttachSlot {
+        /// Named target declared via `slotTarget`.
+        name: Arc<str>,
+        /// Wrapper view owned by the mounting tenant.
+        child: NodeId,
+    },
+    /// Detaches and unregisters guest slot wrapper node `child`.
+    DetachSlot {
+        /// Wrapper view previously passed to [`Op::AttachSlot`].
+        child: NodeId,
+    },
 }
 
 #[cfg(test)]

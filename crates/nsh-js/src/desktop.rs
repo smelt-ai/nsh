@@ -572,8 +572,11 @@ unsafe fn popup_menu(
     // places `at`. macOS and Linux show the app's menus as one app menu, so
     // the app root keeps them there. The app root (the host) also remains
     // the target when no window is focused.
+    // A plugin's goes to the root, which reports its items to it.
     let target = match os(cx) {
-        Os::Windows => crate::window::focused_node(cx).unwrap_or(ROOT_ID),
+        Os::Windows if !crate::dom::is_guest(cx) => {
+            crate::window::focused_node(cx).unwrap_or(ROOT_ID)
+        }
         _ => ROOT_ID,
     };
     match listen(cx).and_then(|()| send_to(cx, target, DesktopCommand::PopupMenu { items, at })) {

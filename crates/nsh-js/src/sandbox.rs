@@ -263,6 +263,11 @@ impl Budget {
         }
     }
 
+    /// Whether the last call overran its budget (without consuming it).
+    pub(crate) fn is_tripped(&self) -> bool {
+        self.tripped.get().is_some()
+    }
+
     /// Why the last call was cut off, if it overran its budget.
     pub(crate) fn take_trip(&self) -> Option<String> {
         self.tripped.take().map(|phase| {

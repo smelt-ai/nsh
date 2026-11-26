@@ -553,6 +553,19 @@ impl AppView {
         *self.surface.chrome.on_close.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Loads (or replaces) a sandboxed guest plugin VM inside the running
+    /// surface engine. The plugin shares this surface's tree, overlay stack,
+    /// focus chain and accessibility tree while running in its own QuickJS VM.
+    pub fn load_plugin(&self, plugin: nsh_engine::PluginConfig) {
+        self.surface.control(|c| c.load_plugin(plugin));
+    }
+
+    /// Unloads guest plugin `id` and frees its nodes, components and JS heap.
+    pub fn unload_plugin(&self, id: impl Into<String>) {
+        let id = id.into();
+        self.surface.control(|c| c.unload_plugin(id));
+    }
+
     /// Stops the app.
     pub fn stop(&self) {
         self.surface.stop();

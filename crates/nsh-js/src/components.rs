@@ -47,14 +47,13 @@ type JsContext = qjs::JSContext;
 const UNDEFINED: JsValue = qjs::JS_UNDEFINED;
 
 /// The components' part of a context's state.
-#[derive(Default)]
 pub(crate) struct Components {
     /// The specs of the components made so far (functions name them by
     /// index).
     specs: RefCell<Vec<Arc<ComponentSpec>>>,
     /// Calls waiting for a result: call number -> (resolve, reject), owned.
     pending: RefCell<FxHashMap<u32, (JsValue, JsValue)>>,
-    calls: Cell<u32>,
+    ids: crate::host::SharedIds,
     /// The events each component host has an `on<Event>` handler for, so
     /// an event nobody handles is not converted to JS (a component may
     /// report on every scroll frame).
@@ -94,6 +93,19 @@ struct FnRender {
 }
 
 impl Components {
+    pub(crate) fn new(ids: crate::host::SharedIds) -> Self {
+        Self {
+            specs: RefCell::new(Vec::new()),
+            pending: RefCell::new(FxHashMap::default()),
+            ids,
+            handled: RefCell::new(FxHashMap::default()),
+            fn_renders: RefCell::new(FxHashMap::default()),
+            props_of: Cell::new(None),
+            prop_keys: RefCell::new(Vec::new()),
+            handlers: RefCell::new(FxHashMap::default()),
+        }
+    }
+
     /// Frees the values the components hold (the state is unregistered).
     pub(crate) fn free_all(&mut self, raw: *mut JsContext) {
         for (_, (resolve, reject)) in self.pending.borrow_mut().drain() {
@@ -219,10 +231,7 @@ fn handler_name(event: &str) -> String {
 
 /// A new call number (never 0: no reply).
 pub(crate) fn next_call(cx: *mut JsContext) -> u32 {
-    let c = components(cx);
-    let n = c.calls.get().wrapping_add(1).max(1);
-    c.calls.set(n);
-    n
+    components(cx).ids.next_call()
 }
 
 /// The promise of call `call`'s result, settled when the core's events

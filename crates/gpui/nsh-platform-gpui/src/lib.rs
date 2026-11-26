@@ -64,6 +64,8 @@ mod window;
 
 // Windows of GPUI's test platform, which `shot` turns on.
 #[cfg(all(test, feature = "shot"))]
+mod plugin_tests;
+#[cfg(all(test, feature = "shot"))]
 mod tests;
 
 pub use gpui;
@@ -75,7 +77,7 @@ pub use nsh_core::{
 };
 pub use nsh_engine::{
     App, AppError, AppErrorKind, Bundle, ByteSize, CacheLocation, CacheOptions, CachePolicy,
-    Limits, PackageInfo, Root,
+    HostChannel, Limits, PackageInfo, PluginConfig, Root,
 };
 /// Signed packages: verifying, unpacking and accepting them
 /// (`docs/dev/signed-packages.md`).

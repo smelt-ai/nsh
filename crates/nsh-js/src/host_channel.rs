@@ -158,12 +158,16 @@ pub(crate) fn extend(cx: Ctx, host: Raw) -> Raw {
             let native_on = js::function(cx, c"on", on, 2)?;
             let arguments = [args.get(0), args.get(1)];
             let native_off = js::call(cx, native_on.raw(), UNDEFINED, &arguments)?;
-            let platform_off = js::call(cx, captures[0].raw(), UNDEFINED, &arguments)?;
-            let off = closure(cx, vec![native_off, platform_off], |cx, values, _| {
-                js::call(cx, values[0].raw(), UNDEFINED, &[])?;
-                js::call(cx, values[1].raw(), UNDEFINED, &[])?;
-                Ok(V::undefined())
-            })?;
+            let off = if crate::dom::is_guest(cx) {
+                native_off
+            } else {
+                let platform_off = js::call(cx, captures[0].raw(), UNDEFINED, &arguments)?;
+                closure(cx, vec![native_off, platform_off], |cx, values, _| {
+                    js::call(cx, values[0].raw(), UNDEFINED, &[])?;
+                    js::call(cx, values[1].raw(), UNDEFINED, &[])?;
+                    Ok(V::undefined())
+                })?
+            };
             crate::keymap::undo_with_owner(cx, &off);
             Ok(off)
         })?;

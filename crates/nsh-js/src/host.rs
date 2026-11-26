@@ -111,6 +111,79 @@ impl Shared {
 pub type TextMeasurer =
     Box<dyn Fn(&nsh_core::canvas::CanvasFont, &str) -> nsh_core::geometry::Points>;
 
+/// Shared dense ID counters for multiple [`Host`] VMs sharing one [`nsh_core::Core`]
+/// on a single engine thread.
+#[derive(Clone, Debug)]
+pub struct SharedIds(Rc<SharedIdsInner>);
+
+#[derive(Debug)]
+struct SharedIdsInner {
+    node: Cell<NodeId>,
+    anim_node: Cell<u32>,
+    animation: Cell<u32>,
+    anim_composite: Cell<u32>,
+    call: Cell<u32>,
+}
+
+impl Default for SharedIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedIds {
+    /// Creates fresh counters starting at NSH's standard initial values.
+    pub fn new() -> Self {
+        Self(Rc::new(SharedIdsInner {
+            node: Cell::new(2),
+            anim_node: Cell::new(2),
+            animation: Cell::new(2),
+            anim_composite: Cell::new(2),
+            call: Cell::new(0),
+        }))
+    }
+
+    /// Allocates the next even JS [`NodeId`].
+    #[inline]
+    pub(crate) fn next_node(&self) -> NodeId {
+        let id = self.0.node.get();
+        self.0.node.set(id + 2);
+        id
+    }
+
+    /// Allocates the next even JS animation graph node id.
+    #[inline]
+    pub(crate) fn next_anim_node(&self) -> u32 {
+        let id = self.0.anim_node.get();
+        self.0.anim_node.set(id + 2);
+        id
+    }
+
+    /// Allocates the next even JS animation request id.
+    #[inline]
+    pub(crate) fn next_animation(&self) -> u32 {
+        let id = self.0.animation.get();
+        self.0.animation.set(id + 2);
+        id
+    }
+
+    /// Allocates the next even JS composite animation key.
+    #[inline]
+    pub(crate) fn next_anim_composite(&self) -> u32 {
+        let id = self.0.anim_composite.get();
+        self.0.anim_composite.set(id + 2);
+        id
+    }
+
+    /// Allocates the next non-zero call id for async Rust/core replies.
+    #[inline]
+    pub(crate) fn next_call(&self) -> u32 {
+        let n = self.0.call.get().wrapping_add(1).max(1);
+        self.0.call.set(n);
+        n
+    }
+}
+
 /// Lays one line of `text` in `font` out: the font's ascent and descent on
 /// it, in points.
 pub type LineExtentMeasurer = Box<
@@ -132,6 +205,9 @@ pub struct Host {
     on_error: Option<ErrorHandler>,
     on_rejection: Option<ErrorHandler>,
     budget: Budget,
+    /// Stop the VM permanently when a load/call budget is exceeded (used for
+    /// sandboxed plugin VMs sharing an engine thread).
+    stop_on_budget_trip: bool,
     evaluations: RefCell<Vec<Persistent<Promise<'static>>>>,
     entry_depth: Cell<usize>,
 }
@@ -156,6 +232,14 @@ pub struct HostOptions {
     /// resolve against: the page's on the web. `None` (native hosts):
     /// they are invalid, as there is no document they belong to.
     pub base_url: Option<String>,
+    /// Shared ID allocator when multiple VMs share a single [`nsh_core::Core`].
+    pub shared_ids: Option<SharedIds>,
+    /// Runs as a guest plugin VM: mounts into named slots via `mountSlot`
+    /// instead of owning `ROOT_ID`.
+    pub guest: bool,
+    /// Permanently stops the VM as soon as a call or load exceeds its CPU
+    /// budget, preventing repeated stalls on a shared engine thread.
+    pub stop_on_budget_trip: bool,
 }
 
 impl Host {
@@ -194,8 +278,18 @@ impl Host {
                     .track(&cx, promise, reason, handled);
             },
         ))));
+        let shared_ids = options.shared_ids.unwrap_or_default();
+        let guest = options.guest;
+        let stop_on_budget_trip = options.stop_on_budget_trip;
         cx.with(|cx| {
-            crate::state::install(&cx, shared.clone(), &options.ui_sets, options.posts.clone());
+            crate::state::install(
+                &cx,
+                shared.clone(),
+                &options.ui_sets,
+                options.posts.clone(),
+                shared_ids,
+                guest,
+            );
             web::web(cx.as_raw().as_ptr()).base_url = options
                 .base_url
                 .as_deref()
@@ -219,6 +313,7 @@ impl Host {
             on_error: None,
             on_rejection: None,
             budget,
+            stop_on_budget_trip,
             evaluations: RefCell::new(Vec::new()),
             entry_depth: Cell::new(0),
         })
@@ -270,6 +365,13 @@ impl Host {
         if self.exhausted.load(Ordering::Relaxed) && self.shared.fatal.borrow().is_none() {
             self.uncaught(&JsError::new("out of memory".to_owned()));
         }
+        if self.stop_on_budget_trip
+            && self.budget.is_tripped()
+            && self.shared.fatal.borrow().is_none()
+            && let Some(trip) = self.budget.take_trip()
+        {
+            self.shared.stop(trip);
+        }
         self.entry_depth.set(self.entry_depth.get() - 1);
         if self.entry_depth.get() == 0 && self.fatal().is_some() {
             self.stop_work();
@@ -304,6 +406,9 @@ impl Host {
     /// memory get a message saying so (exhausted memory also stops the VM).
     fn classify(&self, mut err: JsError) -> JsError {
         if let Some(trip) = self.budget.take_trip() {
+            if self.stop_on_budget_trip {
+                self.shared.stop(trip.clone());
+            }
             err.message = format!("{trip}\n{}", err.message);
         } else if self.exhausted.load(Ordering::Relaxed) {
             let reason = format!(

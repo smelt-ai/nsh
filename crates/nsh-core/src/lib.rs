@@ -117,8 +117,8 @@ pub use text::ApproxPrepared;
 pub use crate::{
     color::{Hsla, Rgba},
     core::{
-        ApplyError, Core, ListBind, ListScrollPosition, MAX_TREE_DEPTH, Measurement,
-        set_part_requester,
+        ApplyError, Core, ListBind, ListScrollPosition, MAX_TREE_DEPTH, Measurement, SHELL_TENANT,
+        TenantId, guest_writes_root, set_part_requester,
     },
     effects::{
         BackdropMaterial, BlendMode, BoxShadow, ClipInset, ColorStop, Cursor, Effects, Filter,

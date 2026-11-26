@@ -643,6 +643,24 @@ pub(crate) struct Built {
 }
 
 impl Built {
+    #[cfg(test)]
+    pub(crate) fn summary(&self) -> (usize, Vec<String>) {
+        let mut labels = Vec::new();
+        for entry in &self.entries {
+            if let Some(val) = entry.node.value()
+                && !val.is_empty()
+            {
+                labels.push(val.to_owned());
+            }
+            if let Some(label) = entry.node.label()
+                && !label.is_empty()
+            {
+                labels.push(label.to_owned());
+            }
+        }
+        (self.entries.len(), labels)
+    }
+
     fn index(&self, id: accesskit::NodeId) -> Option<usize> {
         self.entries.iter().position(|e| e.id == id)
     }

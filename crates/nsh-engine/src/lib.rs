@@ -23,6 +23,7 @@ pub mod logging;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod perf;
+mod plugins;
 mod script;
 #[cfg_attr(not(feature = "shader"), path = "shader_off.rs")]
 pub mod shader;
@@ -55,8 +56,8 @@ pub use app_directory::app_dir_name;
 use crossbeam_channel::{Receiver, Sender};
 pub use local_storage::local_storage_prefix;
 use nsh_core::{
-    ApplyError, Core, EdgeInsets, EventKind, EventPayload, ListBind, MountBatch, NodeId, Op,
-    PayloadValue, TextEngine, element::JsEvent, platform::content_type, time::Instant,
+    Core, EdgeInsets, EventKind, EventPayload, ListBind, MountBatch, NodeId, Op, PayloadValue,
+    SHELL_TENANT, TenantId, TextEngine, element::JsEvent, platform::content_type, time::Instant,
 };
 pub use nsh_core::{
     JsonValue,
@@ -89,6 +90,10 @@ pub use crate::{
     cache::{ByteSize, CacheLocation, CacheOptions, CachePolicy},
     error::{AppError, AppErrorKind, PackageInfo},
     host_channel::{HostCall, HostChannel, HostReply, OpenUrlRequest},
+    plugins::{
+        DEFAULT_PLUGIN_CALL_BUDGET, DEFAULT_PLUGIN_CPU_WINDOW, DEFAULT_PLUGIN_LOAD_BUDGET,
+        DEFAULT_PLUGIN_MAX_NODES, DEFAULT_PLUGIN_MEMORY_BYTES, EngineStats, PluginConfig,
+    },
 };
 use crate::{
     host_channel::HostRefusal,
@@ -1579,6 +1584,16 @@ enum Message {
     /// ([`nsh_core::element::host_call`], and JS's calls without a
     /// channel of their own).
     CoreHostReply(u64, Result<nsh_core::JsonValue, String>),
+    /// Loads (or reloads) a sandboxed guest plugin VM on this engine thread.
+    LoadPlugin(PluginConfig),
+    /// Unloads a guest plugin VM by id and tears down its entire tenant subtree.
+    UnloadPlugin(String),
+    /// Event delivered to a guest plugin VM's `HostChannel`.
+    PluginHostEvent(TenantId, String, nsh_core::JsonValue),
+    /// Answer delivered to a guest plugin VM's `HostChannel` call.
+    PluginHostReply(TenantId, u64, Result<nsh_core::JsonValue, String>),
+    /// Queries live node count, active plugin count and total loop wakeups.
+    SnapshotStats(Box<dyn FnOnce(EngineStats) + Send>),
     /// The embedding app's URL handler answered URL request `id`: it took
     /// the URL, or the platform opens it.
     UrlHandled {
@@ -1911,6 +1926,23 @@ impl EngineControl {
     pub fn register_font(&self, data: Vec<u8>) {
         let _ = self.tx.send(Message::HostFont(data));
     }
+
+    /// Loads (or replaces) a sandboxed guest plugin VM sharing this engine's
+    /// [`Core`] and surface.
+    pub fn load_plugin(&self, config: PluginConfig) {
+        let _ = self.tx.send(Message::LoadPlugin(config));
+    }
+
+    /// Unloads the guest plugin VM with `id` and frees its nodes, components
+    /// and QuickJS heap.
+    pub fn unload_plugin(&self, id: impl Into<String>) {
+        let _ = self.tx.send(Message::UnloadPlugin(id.into()));
+    }
+
+    /// Queries [`EngineStats`] on the engine thread once queued work settles.
+    pub fn snapshot_stats(&self, done: impl FnOnce(EngineStats) + Send + 'static) {
+        let _ = self.tx.send(Message::SnapshotStats(Box::new(done)));
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1962,6 +1994,7 @@ impl Engine {
         let (tx, rx) = crossbeam_channel::unbounded();
         let modality = Arc::default();
         let downloads = nsh_core::webview::downloads::DownloadCleanup::new();
+        let wakeups = Arc::new(std::sync::atomic::AtomicU64::new(0));
         setup(&EngineControl {
             tx: tx.clone(),
             modality: Arc::clone(&modality),
@@ -1986,6 +2019,7 @@ impl Engine {
                     engine_stop,
                     engine_quit_listeners,
                     engine_downloads,
+                    wakeups,
                 )
             })?;
         Ok(Engine {
@@ -2075,6 +2109,7 @@ const QUIT_GRACE: Duration = Duration::from_millis(20);
 const RESIZE_BURST_GAP: Duration = Duration::from_millis(120);
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments, reason = "engine thread startup state")]
 fn run<M: TextEngine + 'static, S: MountSink>(
     config: EngineConfig,
     text_engine: M,
@@ -2083,19 +2118,28 @@ fn run<M: TextEngine + 'static, S: MountSink>(
     stop: Arc<std::sync::atomic::AtomicBool>,
     quit_listeners: Arc<std::sync::atomic::AtomicBool>,
     downloads: nsh_core::webview::downloads::DownloadCleanup,
+    wakeups: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let (tx, rx) = messages;
     raise_thread_priority();
     // The thread's time is the engine's from its first line of JS on.
     let _clock = config.clock.enter();
     let _context = config.context.enter();
-    let Some(mut driver) = Driver::start(config, text_engine, Rc::new(sink), tx, &rx, stop) else {
+    let Some(mut driver) = Driver::start(
+        config,
+        text_engine,
+        Rc::new(sink),
+        tx,
+        &rx,
+        stop,
+        Arc::clone(&wakeups),
+    ) else {
         return;
     };
     driver.state.core.set_download_cleanup(downloads);
     driver.quit_listeners = quit_listeners;
     driver.sync_quit_listeners();
-    drive(&mut driver, &rx);
+    drive(&mut driver, &rx, &wakeups);
     driver.quit(&rx);
     // Stopped on purpose (a crash never gets here): a trial is over.
     if let Some(trial) = &driver.trial {
@@ -2125,7 +2169,11 @@ fn start_trial(trial: Arc<dyn Trial>) {
 
 /// Runs the engine's loop until it stops.
 #[cfg(not(target_arch = "wasm32"))]
-fn drive<M: TextEngine + 'static>(driver: &mut Driver<M>, rx: &Receiver<Message>) {
+fn drive<M: TextEngine + 'static>(
+    driver: &mut Driver<M>,
+    rx: &Receiver<Message>,
+    wakeups: &std::sync::atomic::AtomicU64,
+) {
     loop {
         let message = match driver.deadline() {
             Some(deadline) => match rx.recv_deadline(deadline) {
@@ -2138,6 +2186,7 @@ fn drive<M: TextEngine + 'static>(driver: &mut Driver<M>, rx: &Receiver<Message>
                 Err(_) => return,
             },
         };
+        wakeups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let started = driver.state.perf.is_some().then(Instant::now);
         if let Some(message) = message {
             if !driver.handle(message, rx) {
@@ -2197,6 +2246,7 @@ impl<M: TextEngine + 'static> LocalEngine<M> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let downloads = nsh_core::webview::downloads::DownloadCleanup::new();
+        let wakeups = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let control = EngineControl {
             tx: tx.clone(),
             modality: Arc::default(),
@@ -2205,7 +2255,15 @@ impl<M: TextEngine + 'static> LocalEngine<M> {
         setup(&control);
         let _clock = config.clock.enter();
         let _context = config.context.enter();
-        let mut driver = Driver::start(config, text_engine, Rc::new(sink), tx, &rx, stop)?;
+        let mut driver = Driver::start(
+            config,
+            text_engine,
+            Rc::new(sink),
+            tx,
+            &rx,
+            stop,
+            wakeups,
+        )?;
         driver.state.core.set_download_cleanup(downloads);
         Some(LocalEngine {
             driver: ManuallyDrop::new(driver),
@@ -2385,6 +2443,8 @@ struct Driver<M: TextEngine + 'static> {
     script: Option<Script>,
     sink: Rc<dyn MountSink>,
     assets: Option<Arc<dyn Assets>>,
+    /// Resources retained to spawn sandboxed guest plugin VMs on this thread.
+    plugin_env: plugins::PluginHostEnv<M>,
     /// A VM stopped for good (out of memory, over a quota) is reported
     /// once; its views stay as they were and no JS runs any more.
     stopped: bool,
@@ -2426,6 +2486,7 @@ impl<M: TextEngine + 'static> Driver<M> {
         tx: Sender<Message>,
         rx: &Receiver<Message>,
         stop: Arc<std::sync::atomic::AtomicBool>,
+        wakeups: Arc<std::sync::atomic::AtomicU64>,
     ) -> Option<Self> {
         config.pinned.apply(&mut config.environment);
         drawn_shaders(&mut config.environment, false);
@@ -2614,6 +2675,9 @@ impl<M: TextEngine + 'static> Driver<M> {
             }
         }
         let js_tokens = core.tokens().clone();
+        let plugins = plugins::Plugins::new(config.content_culling);
+        #[cfg(feature = "js-core")]
+        let shell_shared_ids = plugins.shared_ids();
         let state = State {
             core,
             published_content_height: None,
@@ -2647,10 +2711,13 @@ impl<M: TextEngine + 'static> Driver<M> {
             events_reported: 0,
             pinned: config.pinned,
             environment: config.environment,
+            displays: displays.clone(),
             shaders_unavailable: false,
             app_locale: None,
             host: config.host.clone(),
             url_opens: Vec::new(),
+            shell_posts: posts.clone(),
+            plugins,
             host_requests: Vec::new(),
             net: Net {
                 network: config.network.clone(),
@@ -2670,11 +2737,20 @@ impl<M: TextEngine + 'static> Driver<M> {
         let mut environment = config.environment;
         environment.window = config.viewport;
         let start = Instant::now();
+        let plugin_env = plugins::PluginHostEnv::new(
+            &config,
+            text_engine.clone(),
+            stop.clone(),
+            #[cfg(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32")))]
+            app_url.clone(),
+            wakeups,
+        );
         let mut driver = Driver {
             state,
             script: None,
             sink: sink.clone(),
             assets: config.assets.clone(),
+            plugin_env,
             stopped: false,
             last_gc: Instant::now(),
             last_active: Instant::now(),
@@ -2710,6 +2786,12 @@ impl<M: TextEngine + 'static> Driver<M> {
                         }),
                         host: Rc::new(host_bridge),
                         lazy_rows: config.content_culling,
+                        #[cfg(feature = "js-core")]
+                        shared_ids: Some(shell_shared_ids),
+                        #[cfg(feature = "js-core")]
+                        guest: false,
+                        #[cfg(feature = "js-core")]
+                        plugin_id: None,
                     }
                 };
                 #[cfg(not(any(
@@ -2754,7 +2836,12 @@ impl<M: TextEngine + 'static> Driver<M> {
             .into_iter()
             .chain(std::iter::from_fn(|| rx.try_recv().ok()));
         for message in pending {
-            if let Message::Advance(..) | Message::Flush(..) = message {
+            if let Message::Advance(..)
+            | Message::Flush(..)
+            | Message::LoadPlugin(..)
+            | Message::UnloadPlugin(..)
+            | Message::SnapshotStats(..) = message
+            {
                 moves.push(message);
             } else if !handle(script, state, message) {
                 return None;
@@ -2809,8 +2896,9 @@ impl<M: TextEngine + 'static> Driver<M> {
     /// (on the system's clock; a manual one moves only when told), or the
     /// idle collection (the system's time, whatever the clock).
     fn deadline(&self) -> Option<Instant> {
-        let gc_deadline =
-            (self.script.is_some() && self.state.committed_since_gc).then(|| self.next_gc());
+        let gc_needed = (self.script.is_some() && self.state.committed_since_gc)
+            || self.state.plugins.has_dirty_gc();
+        let gc_deadline = gc_needed.then(|| self.next_gc());
         let due = if self.clock.is_manual() {
             None
         } else {
@@ -2850,6 +2938,7 @@ impl<M: TextEngine + 'static> Driver<M> {
     fn due(&self) -> Option<Instant> {
         [
             self.script.as_ref().and_then(Script::next_timer),
+            self.state.plugins.next_timer(),
             self.state.next_scroll_event(),
             self.state.next_mouse_move(),
             self.state.core.next_task_timer(),
@@ -2880,6 +2969,24 @@ impl<M: TextEngine + 'static> Driver<M> {
                     .min();
                 done(running && self.idle(rx), due);
                 running
+            }
+            Message::LoadPlugin(plugin) => {
+                plugins::load_plugin(&mut self.state, &self.plugin_env, &self.sink, plugin);
+                true
+            }
+            Message::UnloadPlugin(id) => {
+                self.state.plugins.unload(&id, &mut self.state.core);
+                true
+            }
+            Message::SnapshotStats(done) => {
+                self.turn();
+                done(EngineStats {
+                    nodes: self.state.core.node_count(),
+                    plugins: self.state.plugins.len(),
+                    wakeups: self.plugin_env.wakeup_count(),
+                    has_deadline: self.deadline().is_some(),
+                });
+                true
             }
             // A test's clock on a real platform: the display's frame moves it
             // to the frame's time first (a frame after the last, else now),
@@ -3013,9 +3120,11 @@ impl<M: TextEngine + 'static> Driver<M> {
             ..
         } = self;
         let script = script.as_ref();
+        let now = nsh_core::time::now();
         if script
             .and_then(Script::next_timer)
-            .is_some_and(|due| due <= nsh_core::time::now())
+            .is_some_and(|due| due <= now)
+            || state.plugins.next_timer().is_some_and(|due| due <= now)
         {
             self.last_active = Instant::now();
         }
@@ -3054,12 +3163,24 @@ impl<M: TextEngine + 'static> Driver<M> {
             script.run_timers(nsh_core::time::now());
             script.run_system();
         }
+        if !state.plugins.is_empty() {
+            state.plugins.run_timers(nsh_core::time::now());
+            state.plugins.run_system();
+        }
         state.core.run_component_tasks();
         // What JS timers and Rust component tasks took; a Rust component
         // renders in the commit.
         let tasks = turn_start.map(|s| s.elapsed());
         state.load_fonts(script, assets.as_deref(), &**sink);
-        let batch = state.commit(script);
+        let mut batch = state.commit(script);
+        if state.plugins.reap_stopped(&mut state.core, &**sink)
+            && let Some(cleanup) = state.commit(script)
+        {
+            match &mut batch {
+                Some(b) => extend_frame(&mut b.items, cleanup.items),
+                None => batch = Some(cleanup),
+            }
+        }
         if !self.quitting
             && state.submit_mount(&**sink, batch)
             && let (Some(start), Some(tasks)) = (turn_start, tasks)
@@ -3146,18 +3267,24 @@ impl<M: TextEngine + 'static> Driver<M> {
     /// Collects cycles when the engine has been idle long enough, so
     /// released nodes free their views.
     fn collect_if_idle(&mut self) {
-        if let Some(script) = &self.script
-            && self.state.committed_since_gc
-            && Instant::now() >= self.next_gc()
-        {
+        let shell_dirty = self.script.is_some() && self.state.committed_since_gc;
+        let plugins_dirty = self.state.plugins.has_dirty_gc();
+        if (shell_dirty || plugins_dirty) && Instant::now() >= self.next_gc() {
             let start = self.state.trace.then(Instant::now);
-            script.collect_garbage();
+            if shell_dirty && let Some(script) = &self.script {
+                script.collect_garbage();
+            }
+            if plugins_dirty {
+                self.state.plugins.collect_dirty_gc();
+            }
             if let Some(start) = start {
                 log::info!(target: "nsh::perf", "gc: {}µs", start.elapsed().as_micros());
             }
             // What the app holds, for the performance monitor: read here,
             // when the heap was just walked and nothing waits.
-            if let Some(monitor) = &self.state.perf {
+            if let Some(monitor) = &self.state.perf
+                && let Some(script) = &self.script
+            {
                 let (js_heap, js_objects) = script.heap_usage();
                 monitor.set_memory(perf::MemorySample {
                     js_heap,
@@ -3168,7 +3295,7 @@ impl<M: TextEngine + 'static> Driver<M> {
             }
             self.last_gc = Instant::now();
             self.state.committed_since_gc = false;
-            let batch = self.state.commit(Some(script));
+            let batch = self.state.commit(self.script.as_ref());
             self.state.submit_mount(&*self.sink, batch);
             self.state.run_on_main_thread(&*self.sink);
         }
@@ -3209,6 +3336,12 @@ struct State<M: TextEngine> {
     pinned: EnvironmentPins,
     /// The environment given last, before the app's language is applied.
     environment: Environment,
+    /// Last reported displays (forwarded to guest plugins loaded later).
+    displays: Arc<[nsh_core::desktop::Display]>,
+    /// The shell VM's posted-call queue (swapped on `Core` around guest ops).
+    shell_posts: nsh_core::element::Posts,
+    /// Live sandboxed guest plugin VMs sharing this engine's [`Core`].
+    plugins: plugins::Plugins,
     /// The platform found no GPU for shader views
     /// ([`EngineControl::shaders_unavailable`]).
     shaders_unavailable: bool,
@@ -3684,10 +3817,14 @@ impl<M: TextEngine> State<M> {
 
     /// Sends the pending touch move.
     fn dispatch_touch_move(&mut self, script: Option<&Script>) {
-        if let Some((id, touch)) = self.touch_move.take()
-            && let Some(script) = script
-        {
-            script.dispatch_event(id, EventKind::Touch, &EventPayload::Touch(touch));
+        if let Some((id, touch)) = self.touch_move.take() {
+            self.plugins.route_event(
+                script,
+                &self.core,
+                id,
+                EventKind::Touch,
+                &EventPayload::Touch(touch),
+            );
         }
     }
 
@@ -3716,9 +3853,8 @@ impl<M: TextEngine> State<M> {
             {
                 continue;
             }
-            if let Some(script) = script {
-                script.dispatch_event(id, EventKind::MouseMove, &payload);
-            }
+            self.plugins
+                .route_event(script, &self.core, id, EventKind::MouseMove, &payload);
         }
     }
 
@@ -3758,10 +3894,9 @@ impl<M: TextEngine> State<M> {
                 ("zoomScale", n(e.zoom)),
             ]);
             // A Rust component's scroll view is the component's.
-            if !self.core.component_event(id, EventKind::Scroll, &payload)
-                && let Some(script) = script
-            {
-                script.dispatch_event(id, EventKind::Scroll, &payload);
+            if !self.core.component_event(id, EventKind::Scroll, &payload) {
+                self.plugins
+                    .route_event(script, &self.core, id, EventKind::Scroll, &payload);
             }
         }
     }
@@ -3793,9 +3928,11 @@ impl<M: TextEngine> State<M> {
     fn request_frame(&mut self, script: Option<&Script>, sink: &dyn MountSink) {
         if !self.frame_requested
             && (script.is_some_and(Script::wants_frame)
+                || self.plugins.wants_frame()
                 || self.core.wants_frame()
                 || self.core.has_paced_mounts()
-                || (script.is_some() && self.core.has_paced_list_binds()))
+                || ((script.is_some() || !self.plugins.is_empty())
+                    && self.core.has_paced_list_binds()))
         {
             self.frame_requested = true;
             sink.request_frame();
@@ -3882,6 +4019,7 @@ impl<M: TextEngine> State<M> {
         let mut merged: Option<MountBatch> = None;
         let mut commits = 0;
         let mut op_count = 0;
+        let mut shell_op_count = 0;
         let mut js = std::time::Duration::ZERO;
         // The overscan bound this turn ([`PACED_BIND_OPS`]).
         let mut paced = PacedBinds::default();
@@ -3899,59 +4037,64 @@ impl<M: TextEngine> State<M> {
             let js_start = Instant::now();
             // Without JS, lists bind nowhere (Rust components' lists bind in
             // the core).
-            let binds = self.binds.drain(..);
-            if let Some(script) = script {
-                // What JS queued before this round (a timer, a handler) may
-                // change a list's items, and the core works out the overscan
-                // left to bind from the items it has: it applies those ops
-                // first, and the overscan waits for the next round, or a
-                // cell would be bound to an item that is gone.
-                script.take_ops(&mut self.ops);
+            let binds: Vec<ListBind> = self.binds.drain(..).collect();
+            if script.is_some() || !self.plugins.is_empty() {
+                if let Some(script) = script {
+                    script.take_ops(&mut self.ops);
+                }
                 let unapplied = !self.ops.is_empty();
                 for bind in binds {
-                    script.bind_list(bind.list, &bind.binds);
+                    self.plugins
+                        .route_list_bind(script, &self.core, bind.list, &bind.binds);
                 }
-                script.take_ops(&mut self.ops);
-                let mut binds = Vec::new();
+                if let Some(script) = script {
+                    script.take_ops(&mut self.ops);
+                }
+                let mut paced_binds = Vec::new();
                 while frame && !unapplied && paced.left() && self.core.has_paced_list_binds() {
                     let start = Instant::now();
                     let ops = self.ops.len();
-                    self.core.take_paced_list_binds(1, &mut binds);
-                    for bind in binds.drain(..) {
+                    self.core.take_paced_list_binds(1, &mut paced_binds);
+                    for bind in paced_binds.drain(..) {
                         paced.cells += bind.binds.len();
-                        script.bind_list(bind.list, &bind.binds);
+                        self.plugins
+                            .route_list_bind(script, &self.core, bind.list, &bind.binds);
                     }
-                    script.take_ops(&mut self.ops);
+                    if let Some(script) = script {
+                        script.take_ops(&mut self.ops);
+                    }
                     paced.ops += self.ops.len() - ops;
                     paced.time += start.elapsed();
                 }
-            } else {
-                drop(binds);
             }
             // The JS calls Rust queued (callbacks' posts), in order, before
             // the events: a task's posts come before its result.
             if let Some(script) = script {
                 script.run_posted();
             }
+            if !self.plugins.is_empty() {
+                self.plugins.run_posted();
+            }
             // The core's events (layouts, ends reached, ...) on a Rust
             // component's nodes are the component's; the rest are JS's, in
             // order with Rust components' events and calls' results.
-            for event in self.events.drain(..) {
+            let pending_events: Vec<JsEvent> = self.events.drain(..).collect();
+            for event in pending_events {
                 match event {
                     JsEvent::Event(id, event, payload) => {
                         if matches!(event, EventKind::KeyDown | EventKind::KeyUp) {
                             dispatch_key(
                                 script,
                                 &mut self.core,
+                                &mut self.plugins,
                                 &mut self.key_path,
                                 id,
                                 event,
                                 &payload,
                             );
-                        } else if !self.core.component_event(id, event, &payload)
-                            && let Some(script) = script
-                        {
-                            script.dispatch_event(id, event, &payload);
+                        } else if !self.core.component_event(id, event, &payload) {
+                            self.plugins
+                                .route_event(script, &self.core, id, event, &payload);
                         }
                     }
                     JsEvent::LayoutListener {
@@ -3962,46 +4105,26 @@ impl<M: TextEngine> State<M> {
                     } => {
                         self.core.component_layout(host, id, &listener, frame);
                     }
-                    // Without JS nothing waits for them.
-                    other => {
-                        if let Some(script) = script {
-                            script.deliver(other);
-                        }
-                    }
+                    other => self.plugins.route_js_event(script, &mut self.core, other),
                 }
             }
             if let Some(script) = script {
                 script.take_ops(&mut self.ops);
             }
             js += js_start.elapsed();
-            op_count += self.ops.len();
-            // A stop drops the rest of the ops, releasing what they hold
-            // for Rust classes.
-            let mut ops = self.ops.drain(..);
-            while let Some(op) = ops.next() {
-                match self.core.apply(op) {
-                    Ok(()) => {}
-                    Err(err) if err.is_fatal() => {
-                        self.core.discard_ops(ops.by_ref());
-                        let Some(script) = script else { break };
-                        script.stop(match err {
-                            ApplyError::TooManyNodes(max) => {
-                                format!("the app created more than {max} nodes and was stopped")
-                            }
-                            ApplyError::TooDeep(max) => {
-                                format!("the app nested views more than {max} deep and was stopped")
-                            }
-                            other => {
-                                format!("the app sent an invalid op ({other:?}) and was stopped")
-                            }
-                        });
-                        break;
-                    }
-                    Err(err) => log::error!("invalid op: {err:?}"),
-                }
+            // Apply shell ops first under `SHELL_TENANT`, then each guest plugin's ops.
+            if !self.ops.is_empty() {
+                self.core.set_posts(self.shell_posts.clone());
+                let applied =
+                    self.plugins
+                        .apply_ops(&mut self.core, &mut self.ops, SHELL_TENANT, script);
+                shell_op_count += applied;
+                op_count += applied;
             }
-            drop(ops);
-            release_spare_ops(&mut self.ops);
+            op_count +=
+                self.plugins
+                    .apply_all_ops(&mut self.core, &mut self.ops, &self.shell_posts);
+
             if let Some(batch) = self.core.commit() {
                 commits += 1;
                 match &mut merged {
@@ -4017,16 +4140,22 @@ impl<M: TextEngine> State<M> {
             // events' new listeners changed shows, in another round.
             let host = self.host_requests();
             // Posts the ops queued (in program order) run in another round.
-            let posted = script.is_some_and(Script::has_posted);
+            let posted = script.is_some_and(Script::has_posted) || self.plugins.has_posted();
             // New tokens (the app's theme, the embedding app's) reach what
             // read them in JS, whose ops come in another round.
-            let retheme = match script {
-                Some(script) if !Arc::ptr_eq(self.core.tokens(), &self.js_tokens) => {
-                    self.js_tokens = self.core.tokens().clone();
+            let retheme = if (script.is_some() || !self.plugins.is_empty())
+                && !Arc::ptr_eq(self.core.tokens(), &self.js_tokens)
+            {
+                self.js_tokens = self.core.tokens().clone();
+                if let Some(script) = script {
                     script.set_tokens(self.js_tokens.clone());
-                    true
                 }
-                _ => false,
+                if !self.plugins.is_empty() {
+                    self.plugins.broadcast_tokens(self.js_tokens.clone());
+                }
+                true
+            } else {
+                false
             };
             // A language the app asked for reaches the core and JS, whose
             // views follow it in another round.
@@ -4038,7 +4167,9 @@ impl<M: TextEngine> State<M> {
                 }
                 None => false,
             };
-            let more_paced = script.is_some() && paced.left() && self.core.has_paced_list_binds();
+            let more_paced = (script.is_some() || !self.plugins.is_empty())
+                && paced.left()
+                && self.core.has_paced_list_binds();
             // What waited for the app's answer to the events just taken runs
             // in the next round, once JS has handled them, and shows in this
             // batch.
@@ -4061,7 +4192,7 @@ impl<M: TextEngine> State<M> {
         {
             keep_last_sets(&mut batch.items, &mut self.sets_seen);
         }
-        self.committed_since_gc |= op_count > 0;
+        self.committed_since_gc |= shell_op_count > 0;
         if self.perf.is_some() && (op_count > 0 || merged.is_some()) {
             let c = &mut self.perf_commit;
             c.layout += start.elapsed().saturating_sub(js);
@@ -4261,6 +4392,9 @@ fn apply_environment<M: TextEngine>(
     if let Some(script) = script {
         script.set_environment(&env);
     }
+    if !state.plugins.is_empty() {
+        state.plugins.broadcast_environment(&env);
+    }
 }
 
 /// Notifies every view a key transition reaches, from one platform event:
@@ -4270,6 +4404,7 @@ fn apply_environment<M: TextEngine>(
 fn dispatch_key<M: TextEngine>(
     script: Option<&Script>,
     core: &mut nsh_core::Core<M>,
+    plugins: &mut plugins::Plugins,
     path: &mut Vec<NodeId>,
     id: NodeId,
     event: EventKind,
@@ -4280,10 +4415,8 @@ fn dispatch_key<M: TextEngine>(
         core.component_event(node, event, payload);
         // A node with no listener (Rust or JS) hears nothing: no event
         // object is built for it.
-        if core.listens(node, event)
-            && let Some(script) = script
-        {
-            script.dispatch_event(node, event, payload);
+        if core.listens(node, event) {
+            plugins.route_event(script, core, node, event, payload);
         }
     }
     path.clear();
@@ -4295,13 +4428,12 @@ fn dispatch_key<M: TextEngine>(
 fn press_outside<M: TextEngine>(
     script: Option<&Script>,
     core: &mut nsh_core::Core<M>,
+    plugins: &mut plugins::Plugins,
     pressed: Vec<(NodeId, EventPayload)>,
 ) {
     for (overlay, payload) in pressed {
-        if !core.component_event(overlay, EventKind::PressOutside, &payload)
-            && let Some(script) = script
-        {
-            script.dispatch_event(overlay, EventKind::PressOutside, &payload);
+        if !core.component_event(overlay, EventKind::PressOutside, &payload) {
+            plugins.route_event(script, core, overlay, EventKind::PressOutside, &payload);
         }
     }
 }
@@ -4360,7 +4492,7 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             // before the view asks for one again where the pointer is.
             if let EventPayload::ContextMenu(menu) = &payload {
                 let pressed = state.core.context_menu_presses_outside(id, menu);
-                press_outside(script, &mut state.core, pressed);
+                press_outside(script, &mut state.core, &mut state.plugins, pressed);
             }
             // Key transitions bubble to the focused view's enabled
             // ancestors within its window, for Rust and JS listeners
@@ -4369,6 +4501,7 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
                 dispatch_key(
                     script,
                     &mut state.core,
+                    &mut state.plugins,
                     &mut state.key_path,
                     id,
                     event,
@@ -4390,14 +4523,19 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
                 }
                 // Moves before a start, end or cancel go first.
                 state.dispatch_touch_move(script);
-                if let Some(script) = script {
-                    script.dispatch_event(id, event, &EventPayload::Touch(touch));
-                }
+                state.plugins.route_event(
+                    script,
+                    &state.core,
+                    id,
+                    event,
+                    &EventPayload::Touch(touch),
+                );
                 return true;
             }
-            let Some(script) = script else { return true };
             let start = state.trace.then(Instant::now);
-            script.dispatch_event(id, event, &payload);
+            state
+                .plugins
+                .route_event(script, &state.core, id, event, &payload);
             if let Some(start) = start {
                 // The handler, its microtasks and the decode of what it
                 // committed.
@@ -4431,6 +4569,7 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             if let Some(script) = script {
                 script.set_lazy_rows(enabled);
             }
+            state.plugins.set_lazy_rows(enabled);
         }
         Message::InputScroll(id, offset, content, viewport) => {
             state.core.set_input_scroll(id, offset, content, viewport);
@@ -4441,9 +4580,9 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
         Message::AnimationsFinished(mut finished) => {
             // The components' animations end in the core, JS's in JS.
             state.core.animations_finished(&mut finished);
-            if let Some(script) = script {
-                script.animations_finished(&finished);
-            }
+            state
+                .plugins
+                .route_animations_finished(script, &mut state.core, finished);
         }
         Message::Resize(size) => {
             // The next within a burst's gap: a window being dragged. A manual
@@ -4477,8 +4616,12 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
         }
         Message::Displays(displays) => {
             state.core.set_displays(displays.clone());
+            state.displays = displays.clone();
             if let Some(script) = script {
                 script.set_displays(&displays);
+            }
+            if !state.plugins.is_empty() {
+                state.plugins.broadcast_displays(&displays);
             }
         }
         Message::RootSize(id, size, insets) => {
@@ -4491,11 +4634,11 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
         Message::OverlayArea(area) => state.core.set_overlay_area(area),
         Message::PressBeyondRoot(page) => {
             let pressed = state.core.presses_beyond_root(page);
-            press_outside(script, &mut state.core, pressed);
+            press_outside(script, &mut state.core, &mut state.plugins, pressed);
         }
         Message::PressOnNative(id, page) => {
             let pressed = state.core.presses_on_native(id, page);
-            press_outside(script, &mut state.core, pressed);
+            press_outside(script, &mut state.core, &mut state.plugins, pressed);
         }
         Message::ScreenHeader(id, height) => state.core.set_screen_header(id, height),
         Message::Frame => {
@@ -4505,6 +4648,9 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             state.core.run_frame(nsh_core::time::now());
             if let Some(script) = script {
                 script.run_frame();
+            }
+            if !state.plugins.is_empty() {
+                state.plugins.run_frame();
             }
         }
         Message::States(id, states) => state.core.set_states(id, states),
@@ -4564,8 +4710,12 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
         }
         Message::Tokens(tokens) => {
             state.core.set_host_tokens(tokens.map(|t| *t));
+            let theme_tokens = state.core.theme_tokens();
             if let Some(script) = script {
-                script.set_theme_tokens(state.core.theme_tokens());
+                script.set_theme_tokens(theme_tokens.clone());
+            }
+            if !state.plugins.is_empty() {
+                state.plugins.broadcast_theme_tokens(theme_tokens);
             }
         }
         Message::HostFont(data) => {
@@ -4589,6 +4739,12 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
             id,
             result.map_err(nsh_core::host_channel::HostError::Failed),
         ),
+        Message::PluginHostEvent(tenant, name, data) => {
+            state.plugins.host_event(tenant, &name, data);
+        }
+        Message::PluginHostReply(tenant, id, result) => {
+            state.plugins.host_reply(tenant, id, result);
+        }
         Message::UrlHandled { id, url, handled } => {
             if handled {
                 state.core.answer_open_url(id, true);
@@ -4596,9 +4752,12 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
                 state.core.open_url_on_platform(id, url);
             }
         }
-        // The driver handles it ([`Driver::handle`]), and keeps the ones
-        // sent before it started for after the first frame.
-        Message::Advance(..) | Message::Flush(..) => unreachable!("the driver moves the clock"),
+        // The driver handles these directly ([`Driver::handle`]).
+        Message::Advance(..)
+        | Message::Flush(..)
+        | Message::LoadPlugin(..)
+        | Message::UnloadPlugin(..)
+        | Message::SnapshotStats(..) => unreachable!("handled by Driver::handle"),
         Message::Shutdown => return false,
     }
     true

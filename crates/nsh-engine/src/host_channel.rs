@@ -31,7 +31,7 @@ use crossbeam_channel::{Receiver, Sender};
 #[cfg(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32")))]
 use nsh_core::host_channel::HostBridge;
 use nsh_core::{
-    JsonValue,
+    JsonValue, SHELL_TENANT, TenantId,
     host_channel::{HostError, HostInbox, HostRequest, ModuleFake, check_name},
 };
 
@@ -108,8 +108,8 @@ struct Inner {
     configured: bool,
     handlers: HashMap<String, Handler>,
     url_handler: Option<UrlHandler>,
-    /// The engine running the view's app: its attachment's id and queue.
-    engine: Option<(u64, Sender<Message>)>,
+    /// The engine running the view's app: its attachment's id, tenant and queue.
+    engine: Option<(u64, TenantId, Sender<Message>)>,
     next_engine: u64,
     /// Events sent while no app ran, for the next one.
     pending: HostInbox,
@@ -197,12 +197,15 @@ impl HostChannel {
         check_name(&name)?;
         let mut inner = self.lock();
         inner.configured = true;
-        if let Some((_, tx)) = &inner.engine
-            && tx
-                .send(Message::HostEvent(name.clone(), data.clone()))
-                .is_ok()
-        {
-            return Ok(());
+        if let Some((_, tenant, tx)) = &inner.engine {
+            let msg = if *tenant == SHELL_TENANT {
+                Message::HostEvent(name.clone(), data.clone())
+            } else {
+                Message::PluginHostEvent(*tenant, name.clone(), data.clone())
+            };
+            if tx.send(msg).is_ok() {
+                return Ok(());
+            }
         }
         if let Some((dropped, _)) = inner.pending.push(name, data) {
             log::warn!(
@@ -315,6 +318,7 @@ impl HostChannel {
                 self.calls.in_flight.fetch_add(1, Ordering::SeqCst);
                 let reply = HostReply {
                     id,
+                    tenant: SHELL_TENANT,
                     name: name.clone(),
                     tx: Some(tx.clone()),
                     calls: Some(self.calls.clone()),
@@ -413,11 +417,29 @@ impl HostChannel {
         for (name, data) in inner.pending.take_all() {
             let _ = tx.send(Message::HostEvent(name, data));
         }
-        inner.engine = Some((id, tx));
+        inner.engine = Some((id, SHELL_TENANT, tx));
         HostAttachment {
             channel: self.clone(),
             id,
-            rx,
+            rx: Some(rx),
+        }
+    }
+
+    /// Attaches a guest plugin VM (`tenant`) to this channel on the shared
+    /// engine queue `tx`. Dropping the returned attachment detaches without
+    /// draining the shared engine receiver.
+    pub(crate) fn attach_tenant(&self, tenant: TenantId, tx: Sender<Message>) -> HostAttachment {
+        let mut inner = self.lock();
+        inner.next_engine += 1;
+        let id = inner.next_engine;
+        for (name, data) in inner.pending.take_all() {
+            let _ = tx.send(Message::PluginHostEvent(tenant, name, data));
+        }
+        inner.engine = Some((id, tenant, tx));
+        HostAttachment {
+            channel: self.clone(),
+            id,
+            rx: None,
         }
     }
 
@@ -426,11 +448,18 @@ impl HostChannel {
     /// as they are now.
     #[cfg(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32")))]
     pub(crate) fn bridge(&self, tx: Sender<Message>) -> EngineBridge {
+        self.bridge_tenant(SHELL_TENANT, tx)
+    }
+
+    /// Like [`HostChannel::bridge`], routing call replies back to `tenant`.
+    #[cfg(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32")))]
+    pub(crate) fn bridge_tenant(&self, tenant: TenantId, tx: Sender<Message>) -> EngineBridge {
         let inner = self.lock();
         EngineBridge {
             params: JsonValue::Object(inner.params.clone()),
             module_fakes: inner.module_fakes.clone(),
             channel: self.clone(),
+            tenant,
             tx,
         }
     }
@@ -440,21 +469,24 @@ impl HostChannel {
 pub(crate) struct HostAttachment {
     channel: HostChannel,
     id: u64,
-    /// Events behind a shutdown message still belong to this channel.
-    rx: Receiver<Message>,
+    /// Events behind a shutdown message still belong to this channel (shell only).
+    rx: Option<Receiver<Message>>,
 }
 
 impl Drop for HostAttachment {
     fn drop(&mut self) {
         let discarded = {
             let mut inner = self.channel.lock();
-            if !inner.engine.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            if !inner.engine.as_ref().is_some_and(|(id, _, _)| *id == self.id) {
                 return;
             }
             inner.engine = None;
+            let Some(rx) = &self.rx else {
+                return;
+            };
             // Detach and drain under the same lock as `send`: every event
             // either waits here or is kept by `send` for the next app.
-            let mut messages: Vec<_> = self.rx.try_iter().collect();
+            let mut messages: Vec<_> = rx.try_iter().collect();
             for message in &mut messages {
                 if let Message::HostEvent(name, data) = message
                     && let Some((dropped, _)) = inner
@@ -482,6 +514,7 @@ pub(crate) struct EngineBridge {
     // A copy, so making a module's exports takes no lock.
     module_fakes: Vec<(String, String, ModuleFake)>,
     channel: HostChannel,
+    tenant: TenantId,
     tx: Sender<Message>,
 }
 
@@ -498,6 +531,7 @@ impl EngineBridge {
             reply: Some(HostReply {
                 id,
                 name: name.to_owned(),
+                tenant: self.tenant,
                 tx: Some(self.tx.clone()),
                 calls: Some(calls),
                 to_core: false,
@@ -704,6 +738,7 @@ impl Drop for OpenUrlRequest {
 pub struct HostReply {
     id: u64,
     name: String,
+    tenant: TenantId,
     /// The queue of the engine that made the call; `None` once answered.
     tx: Option<Sender<Message>>,
     /// Its channel's count of calls, until answered.
@@ -741,11 +776,14 @@ impl HostReply {
     /// Puts `result` on the queue of the engine that made the call, once.
     fn send(&mut self, result: Result<JsonValue, String>) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(if self.to_core {
+            let msg = if self.to_core {
                 Message::CoreHostReply(self.id, result)
-            } else {
+            } else if self.tenant == SHELL_TENANT {
                 Message::HostReply(self.id, result)
-            });
+            } else {
+                Message::PluginHostReply(self.tenant, self.id, result)
+            };
+            let _ = tx.send(msg);
         }
     }
 

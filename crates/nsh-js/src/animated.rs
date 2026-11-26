@@ -40,11 +40,8 @@ pub(crate) struct Animations {
     classes: Cell<Option<Classes>>,
     /// The prototypes (owned): node, value, composite.
     protos: Cell<[JsValue; 3]>,
-    /// Even ids: the core gives Rust components' nodes, animations and
-    /// composites odd ones.
-    next_node: Cell<u32>,
-    next_animation: Cell<u32>,
-    next_composite: Cell<u32>,
+    /// Shared even ID counters across VMs on the same engine thread.
+    ids: crate::host::SharedIds,
     /// Promises of started animations and value reads, by id.
     ends: RefCell<FxHashMap<u32, End>>,
     /// Live composites by key (their finalizers take them out): a run going
@@ -93,22 +90,18 @@ struct Classes {
     composite: qjs::JSClassID,
 }
 
-impl Default for Animations {
-    fn default() -> Self {
+impl Animations {
+    pub(crate) fn new(ids: crate::host::SharedIds) -> Self {
         Animations {
             classes: Cell::new(None),
             protos: Cell::new([UNDEFINED; 3]),
-            next_node: Cell::new(2),
-            next_animation: Cell::new(2),
-            next_composite: Cell::new(2),
+            ids,
             ends: RefCell::new(FxHashMap::default()),
             composites: RefCell::new(FxHashMap::default()),
             derived: RefCell::new(FxHashMap::default()),
         }
     }
-}
 
-impl Animations {
     /// Frees the values held (the state is unregistered).
     pub(crate) fn free_all(&mut self, raw: *mut JsContext) {
         // SAFETY: owned values; no JS runs from here on.
@@ -364,8 +357,7 @@ fn get(cx: *mut JsContext, obj: JsValue, key: &CStr) -> JsValue {
 fn new_node(cx: *mut JsContext, value: bool, inputs: Vec<JsValue>) -> (JsValue, u32) {
     let c = classes(cx);
     let a = animations(cx);
-    let id = a.next_node.get();
-    a.next_node.set(id + 2);
+    let id = a.ids.next_anim_node();
     let proto = a.protos.get()[if value { 1 } else { 0 }];
     let data = Box::into_raw(Box::new(NodeData {
         id,
@@ -811,10 +803,7 @@ fn promise(cx: *mut JsContext) -> (JsValue, JsValue) {
 }
 
 fn next_animation(cx: *mut JsContext) -> u32 {
-    let a = animations(cx);
-    let id = a.next_animation.get();
-    a.next_animation.set(id + 2);
-    id
+    animations(cx).ids.next_animation()
 }
 
 /// Starts driver `config` (`{ type, to, ... }`, taken) on value `this`.
@@ -968,8 +957,7 @@ pub(crate) fn finished(
 fn composite(cx: *mut JsContext, spec: JsValue, values: Vec<JsValue>) -> JsValue {
     let c = classes(cx);
     let a = animations(cx);
-    let key = a.next_composite.get();
-    a.next_composite.set(key + 2);
+    let key = a.ids.next_anim_composite();
     let data = Box::into_raw(Box::new(CompositeData {
         key,
         running: 0,
