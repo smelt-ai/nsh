@@ -16,6 +16,7 @@ mod renders;
 mod resize_anchor;
 mod scrollbars;
 mod services;
+mod shown;
 mod slots;
 mod sticky;
 mod tenant;
@@ -1403,6 +1404,12 @@ pub struct Core<M: TextEngine> {
     /// The placeholders of `<Each>` rows ([`Op::Placeholder`]), with their
     /// ids (a key may be another node's by now).
     placeholders: Vec<(Key, NodeId)>,
+    /// The canvases listening for whether they show, with their ids and
+    /// whether they were last told they do (`shown.rs`).
+    shown: Vec<(Key, NodeId, bool)>,
+    /// What they show in may have changed: laid out, scrolled or made
+    /// views since they were looked at.
+    shown_dirty: bool,
     /// The placeholders whose rows JS is asked to render next
     /// ([`crate::element::JsEvent::Rows`]).
     asked_rows: Vec<NodeId>,
@@ -1827,6 +1834,8 @@ impl<M: TextEngine> Core<M> {
             pace: pace::Pace::default(),
             list_motion: list_motion::ListMotion::default(),
             placeholders: Vec::new(),
+            shown: Vec::new(),
+            shown_dirty: false,
             asked_rows: Vec::new(),
             placeholders_resized: false,
             outer_asked: Vec::new(),
@@ -2343,6 +2352,7 @@ impl<M: TextEngine> Core<M> {
             list.reported(if horizontal { x } else { y }, applied);
         }
         self.cull_moved(key);
+        self.shown_dirty |= moved && !self.shown.is_empty();
         if dependents {
             self.dependents_dirty(key);
         }
@@ -2934,6 +2944,9 @@ impl<M: TextEngine> Core<M> {
                 }
                 if event == EventKind::Layout && enabled && !before.contains(event) {
                     self.report_frame(key);
+                }
+                if event == EventKind::CanvasShown && enabled {
+                    self.track_shown(key);
                 }
                 let node = &self.nodes[key as usize];
                 let key_events = matches!(event, EventKind::KeyDown | EventKind::KeyUp);
@@ -3578,6 +3591,7 @@ impl<M: TextEngine> Core<M> {
         if self.sync_quit_requests() {
             self.commit_round();
         }
+        self.sync_shown();
         self.split_scoped_frames();
         self.mark_shader_inputs();
         if !self.transition_starts.is_empty() {
@@ -3724,6 +3738,7 @@ impl<M: TextEngine> Core<M> {
         }
         self.flush_dirty();
         let relayout = self.needs_layout;
+        self.shown_dirty |= relayout && !self.shown.is_empty();
         if relayout {
             self.needs_layout = false;
             let settling = std::mem::take(&mut self.resize_settling);

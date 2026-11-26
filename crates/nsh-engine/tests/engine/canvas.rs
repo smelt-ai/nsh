@@ -4,9 +4,10 @@
 use std::time::Duration;
 
 use nsh_core::{
-    ApproxTextEngine, MountBatch, MountItem, Size,
+    ApproxTextEngine, MountBatch, MountItem, Size, ViewKind,
     canvas::{CanvasOp, Drawing, LineCap, Num, PathOp},
     geometry::px,
+    time::Clock,
 };
 use nsh_engine::{Bundle, Engine, EngineConfig};
 
@@ -45,6 +46,15 @@ mount(
 
 /// The app, compiled by nsh and loaded as bytecode.
 pub(crate) fn start(app: &str) -> (Engine, crossbeam_channel::Receiver<MountBatch>) {
+    start_with(app, false, Clock::default())
+}
+
+/// [`start`], with scroll views culling their content or not, on `clock`.
+fn start_with(
+    app: &str,
+    content_culling: bool,
+    clock: Clock,
+) -> (Engine, crossbeam_channel::Receiver<MountBatch>) {
     static APPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "nsh-canvas-{}-{}",
@@ -71,7 +81,7 @@ pub(crate) fn start(app: &str) -> (Engine, crossbeam_channel::Receiver<MountBatc
         app: nsh_engine::App::Js(app),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
-        content_culling: false,
+        content_culling,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -85,7 +95,7 @@ pub(crate) fn start(app: &str) -> (Engine, crossbeam_channel::Receiver<MountBatc
         support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
-        clock: Default::default(),
+        clock,
         context: Default::default(),
         pinned: Default::default(),
         clipboard: None,
@@ -290,6 +300,156 @@ fn canvases_redraw_when_what_they_read_changes() {
     assert!(matches!(d[0].ops[0], CanvasOp::LineWidth(Num::Const(1.0))));
     assert!(matches!(d[1].ops[0], CanvasOp::LineWidth(Num::Const(2.0))));
     assert_eq!(d[1].ops.len(), 2);
+}
+
+/// A canvas below a scroll view's fold whose `draw` reads a value that
+/// changes every 20 ms; its line width counts its draws.
+const OUT_OF_VIEW: &str = r#"import { signal, mount } from "nsh";
+import { Canvas, Scroll, View } from "nsh";
+
+const n = signal(0);
+setInterval(() => n.set(n() + 1), 20);
+let draws = 0;
+
+mount(() => (
+  <Scroll style={{ width: 100, height: 100 }}>
+    <View style={{ height: 2000 }} />
+    <Canvas
+      style={{ width: 10, height: 10 }}
+      draw={(cx) => {
+        n();
+        cx.lineWidth = ++draws;
+        cx.stroke();
+      }}
+    />
+  </Scroll>
+));
+"#;
+
+/// A manual clock: the app's time moves only as [`advance`] moves it.
+fn manual_clock() -> Clock {
+    Clock::manual(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600))
+}
+
+/// Moves the app's clock `ms` forward, running what comes due on the way.
+fn advance(engine: &Engine, ms: u64) {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    engine
+        .control()
+        .advance_clock(Duration::from_millis(ms), move || {
+            let _ = tx.send(());
+        });
+    rx.recv_timeout(Duration::from_secs(10)).unwrap();
+}
+
+/// The scroll view made, and the draws counted by the drawings sent, in
+/// what the app sent so far.
+fn drawn(rx: &crossbeam_channel::Receiver<MountBatch>) -> (Option<u32>, Vec<f32>) {
+    let (mut scroll, mut out) = (None, Vec::new());
+    for batch in rx.try_iter() {
+        for item in batch.items {
+            match item {
+                MountItem::Create {
+                    id,
+                    kind: ViewKind::Scroll,
+                } => scroll = Some(id),
+                MountItem::Canvas { drawing, .. } => {
+                    if let Some(CanvasOp::LineWidth(Num::Const(w))) = drawing.ops.first() {
+                        out.push(*w);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (scroll, out)
+}
+
+#[test]
+fn a_canvas_out_of_view_draws_again_only_once_back_in_view() {
+    let (engine, rx) = start_with(OUT_OF_VIEW, true, manual_clock());
+    let scroll_to = |id: u32, y: f32| {
+        engine
+            .control()
+            .scroll(id, nsh_core::Point::new(px(0.0), px(y)), 0);
+    };
+    // Held back below the fold: nothing to draw into, and its value
+    // changes on.
+    advance(&engine, 300);
+    let (scroll, drawn_away) = drawn(&rx);
+    let scroll = scroll.expect("a scroll view");
+    assert!(drawn_away.is_empty(), "{drawn_away:?}");
+    // Scrolled into view: made with what it drew when it was made, and
+    // drawn once more as it shows; then on with its value.
+    scroll_to(scroll, 1950.0);
+    advance(&engine, 100);
+    let (_, shown) = drawn(&rx);
+    let first_new = shown.iter().copied().find(|&w| w > 1.0);
+    assert_eq!(first_new, Some(2.0), "{shown:?}");
+    let before = *shown.last().unwrap();
+    assert!(before > 4.0, "{shown:?}");
+    // Scrolled away (its view kept): told so when the core commits next,
+    // so at most one more draw, then nothing however long its value
+    // changes; back in view, one more draw.
+    scroll_to(scroll, 0.0);
+    advance(&engine, 300);
+    let (_, away) = drawn(&rx);
+    assert!(away.len() <= 1, "{away:?}");
+    let last = away.last().copied().unwrap_or(before);
+    scroll_to(scroll, 1950.0);
+    advance(&engine, 0);
+    let (_, back) = drawn(&rx);
+    assert_eq!(back, [last + 1.0]);
+}
+
+/// A canvas whose `draw` reads a value that changes every 20 ms, in a view
+/// with `display: none` from 100 ms to 400 ms; its line width counts its
+/// draws.
+const DISPLAY_NONE: &str = r#"import { signal, mount } from "nsh";
+import { Canvas, View } from "nsh";
+
+const n = signal(0);
+setInterval(() => n.set(n() + 1), 20);
+const hidden = signal(false);
+setTimeout(() => hidden.set(true), 100);
+setTimeout(() => hidden.set(false), 400);
+let draws = 0;
+
+mount(() => (
+  <View style={{ display: hidden() ? "none" : "flex" }}>
+    <Canvas
+      style={{ width: 10, height: 10 }}
+      draw={(cx) => {
+        n();
+        cx.lineWidth = ++draws;
+        cx.stroke();
+      }}
+    />
+  </View>
+));
+"#;
+
+#[test]
+fn a_canvas_in_a_view_displayed_none_draws_again_only_once_shown() {
+    let (engine, rx) = start_with(DISPLAY_NONE, false, manual_clock());
+    advance(&engine, 90);
+    let (_, shown) = drawn(&rx);
+    let before = *shown.last().unwrap();
+    assert!(before > 2.0, "{shown:?}");
+    // Hidden: told so when the core commits next, then nothing however
+    // long its value changes.
+    advance(&engine, 20);
+    drawn(&rx);
+    advance(&engine, 280);
+    let (_, hidden) = drawn(&rx);
+    assert!(hidden.is_empty(), "{hidden:?}");
+    // Shown again: one draw, then on with its value.
+    advance(&engine, 10);
+    let (_, back) = drawn(&rx);
+    assert!(!back.is_empty(), "{back:?}");
+    advance(&engine, 100);
+    let (_, on) = drawn(&rx);
+    assert!(on.len() > 2, "{on:?}");
 }
 
 /// A `draw` that derives a node from an animated value, run again: the same

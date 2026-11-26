@@ -430,6 +430,7 @@ impl<M: TextEngine> Core<M> {
             before,
         });
         self.cull_made = true;
+        self.shown_dirty |= !self.shown.is_empty();
     }
 
     /// Makes culled `key` and the culled views around it (a command for it

@@ -1280,7 +1280,9 @@ fn class_function(
 /// `<Canvas draw={(cx, size) => …}>`: a view drawn with a 2D context.
 /// `draw` runs once the size is known, and again when the size or the
 /// signals it reads change; animated values passed as numbers or colors
-/// animate without running it.
+/// animate without running it. While the core says it is out of view
+/// ([`EventKind::CanvasShown`]) it does not run: what it reads changing
+/// costs nothing until it shows again, and then it runs once.
 unsafe extern "C" fn canvas(
     cx: *mut JsContext,
     _this: JsValue,
@@ -1303,10 +1305,18 @@ unsafe extern "C" fn canvas(
         let id = dom::node_id(cx, node).unwrap_or(0);
         let set = dom::set_handler(cx, id, EventKind::Layout, on_layout);
         unsafe { qjs::JS_FreeValue(cx, on_layout) };
-        let mut data = [node, props, size];
+        let shown = reactive::new_signal(cx, qjs::JS_TRUE);
+        let mut data = [shown];
+        // SAFETY: the function keeps a dup of `data`; ours is freed below.
+        let on_shown =
+            unsafe { qjs::JS_NewCFunctionData(cx, Some(canvas_shown), 1, 0, 1, data.as_mut_ptr()) };
+        let set = set.and(dom::set_handler(cx, id, EventKind::CanvasShown, on_shown));
+        unsafe { qjs::JS_FreeValue(cx, on_shown) };
+        let mut data = [node, props, size, shown];
         let draw =
-            unsafe { qjs::JS_NewCFunctionData(cx, Some(canvas_draw), 0, 0, 3, data.as_mut_ptr()) };
+            unsafe { qjs::JS_NewCFunctionData(cx, Some(canvas_draw), 0, 0, 4, data.as_mut_ptr()) };
         unsafe { qjs::JS_FreeValue(cx, size) };
+        unsafe { qjs::JS_FreeValue(cx, shown) };
         if let Err(e) = set {
             unsafe { qjs::JS_FreeValue(cx, draw) };
             return Err(e);
@@ -1382,8 +1392,28 @@ unsafe extern "C" fn canvas_layout(
     }
 }
 
-/// The drawing effect: once the size is known, records `draw(cx, size)`
-/// and sends it.
+/// The canvas's `onCanvasShown`: whether it shows.
+unsafe extern "C" fn canvas_shown(
+    cx: *mut JsContext,
+    _this: JsValue,
+    argc: c_int,
+    argv: *mut JsValue,
+    _magic: c_int,
+    data: *mut JsValue,
+) -> JsValue {
+    // SAFETY: one data value (the shown signal).
+    unsafe {
+        let shown = qjs::JS_ToBool(cx, arg(argc, argv, 0)) == 1;
+        let value = if shown { qjs::JS_TRUE } else { qjs::JS_FALSE };
+        if (qjs::JS_ToBool(cx, reactive::peek(cx, *data)) == 1) != shown {
+            reactive::set_signal(cx, *data, value);
+        }
+        reactive::finish_value(cx, UNDEFINED)
+    }
+}
+
+/// The drawing effect: once the size is known and while it shows, records
+/// `draw(cx, size)` and sends it.
 unsafe extern "C" fn canvas_draw(
     cx: *mut JsContext,
     _this: JsValue,
@@ -1392,15 +1422,23 @@ unsafe extern "C" fn canvas_draw(
     _magic: c_int,
     data: *mut JsValue,
 ) -> JsValue {
-    // SAFETY: three data values (node, props, size signal); the values
-    // made here are freed or handed on.
+    // SAFETY: four data values (node, props, size and shown signals); the
+    // values made here are freed or handed on.
     unsafe {
         let (node, props, size_signal) = (*data, *data.add(1), *data.add(2));
+        // Out of view: what `draw` read is let go (the effect tracks only
+        // this and the size), and the last drawing stays.
+        let shown = qjs::JS_Call(cx, *data.add(3), UNDEFINED, 0, ptr::null_mut());
+        if qjs::JS_IsException(shown) {
+            return shown;
+        }
+        let out_of_view = qjs::JS_ToBool(cx, shown) != 1;
+        qjs::JS_FreeValue(cx, shown);
         let size = qjs::JS_Call(cx, size_signal, UNDEFINED, 0, ptr::null_mut());
         if qjs::JS_IsException(size) {
             return size;
         }
-        if !qjs::JS_IsObject(size) {
+        if !qjs::JS_IsObject(size) || out_of_view {
             qjs::JS_FreeValue(cx, size);
             return UNDEFINED;
         }

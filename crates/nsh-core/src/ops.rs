@@ -279,6 +279,7 @@ events! {
     TextDrop = "onTextDrop" as "": "Text dragged from another app or view was dropped on the view (payload: [`EventPayload::TextDrop`]): a Rust component's, such as `RichEditor`'s, which inserts it where it was let go (iOS).",
     OpenAppSettings = "onOpenAppSettings" as "": "A [`Command::OpenAppSettings`] request finished (root only; payload: `id`, `opened`: whether the system opened the app's page in its settings; [`crate::mobile::open_app_settings`]; never reaches a listener).",
     BackProgress = "onBackProgress" as "": "A step of the system's back gesture that no modal takes, while the app listens (root only; Android 14 and later; payload: [`BackProgressEvent::payload`], `phase`, `progress` and `edge`).",
+    CanvasShown = "onCanvasShown" as "": "A canvas came into the viewports of the scroll views around it or left them, or its view was made or held back as they scrolled (payload: [`PayloadValue::Bool`], whether it shows; raised by the core for canvases listening, `core/shown.rs`). `<Canvas>` runs `draw` only while it shows.",
 }
 
 /// What an input holds, for the system's autofill and suggestions

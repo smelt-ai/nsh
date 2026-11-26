@@ -326,6 +326,7 @@ fn windows(cx: &mut TestAppContext) {
     // Layer 2: GPU tile-cached layers for static sibling runs & subtrees.
     static_sibling_run_caches_while_sibling_animates_and_invalidates_on_change(cx);
     canvas_subtree_settles_and_caches_while_sibling_animates(cx);
+    a_canvas_scrolled_out_of_view_draws_again_only_back_in_view(cx);
     hiding_ancestor_releases_descendant_cached_layers(cx);
     image_placeholder_releases_and_tinted_variant_caches(cx);
 }
@@ -2881,6 +2882,91 @@ fn canvas_subtree_settles_and_caches_while_sibling_animates(cx: &mut TestAppCont
         stats.0 >= 1 && stats.1 == 0,
         "expected canvas subtree to settle and hit cache while sibling updates, got {stats:?}"
     );
+
+    view.update(cx, |view, _| view.stop());
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+/// A canvas below a scroll view's fold whose `draw` reads a value that
+/// changes ten times while it is out of view; the field tells how many
+/// times it was drawn and what it read last.
+const CANVAS_OUT_OF_VIEW_APP: &str = r##"
+import { Canvas, mount, Scroll, signal, View } from "nsh";
+import { Input } from "nsh/base";
+
+const n = signal(0);
+const report = signal("start");
+let draws = 0;
+let last = -1;
+setTimeout(() => {
+  let ticks = 0;
+  setInterval(() => {
+    ticks += 1;
+    if (ticks <= 10) n.set(ticks);
+    else report.set(`drawn ${draws} at ${last}`);
+  }, 20);
+}, 300);
+
+function App() {
+  return (
+    <View style={{ flex: 1 }}>
+      <Input autoFocus value={report()} style={{ height: 30 }} />
+      <Scroll style={{ width: 100, height: 60 }}>
+        <View style={{ height: 500 }} />
+        <Canvas
+          style={{ width: 10, height: 10 }}
+          draw={(c) => {
+            draws += 1;
+            last = n();
+            c.fillRect(0, 0, 10, 10);
+          }}
+        />
+      </Scroll>
+    </View>
+  );
+}
+mount(App);
+"##;
+
+fn a_canvas_scrolled_out_of_view_draws_again_only_back_in_view(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", CANVAS_OUT_OF_VIEW_APP, &[]).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| AppView::new(inline_options(), window, cx));
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    let drawn = |cx: &mut VisualTestContext| {
+        let start = Instant::now();
+        loop {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            cx.run_until_parked();
+            if let Some(text) = field_text(&view, cx).filter(|t| t.starts_with("drawn")) {
+                return text;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "never reported");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Drawn once when made; what it reads changes while it is out of view.
+    assert_eq!(drawn(cx), "drawn 1 at 0");
+    // Scrolled into view: drawn once more, with what it reads now.
+    cx.simulate_event(gpui::ScrollEvent {
+        position: gpui::point(gpui::px(50.0), gpui::px(60.0)),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(-1000.0))),
+        ..Default::default()
+    });
+    let start = Instant::now();
+    loop {
+        let text = drawn(cx);
+        if text == "drawn 2 at 10" {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10) && text == "drawn 1 at 0",
+            "the field reads {text:?}"
+        );
+    }
 
     view.update(cx, |view, _| view.stop());
     cx.update(|window, _| window.remove_window());
