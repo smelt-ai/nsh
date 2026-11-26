@@ -288,23 +288,7 @@ when(confirm, move || {
 })
 ```
 
-```tsx tabs
-<Dialog
-  open={confirm()}
-  animation="fade"
-  onOpenChange={({ open }) => confirm.set(open)}
-  backdropClass="bg-black/40"
-  class="m-auto w-80 gap-3 rounded-2xl bg-white p-5"
->
-  <Text style={{ fontSize: 20, fontWeight: "700" }}>删除这一项？</Text>
-  <Button onPress={remove} class="items-center rounded-lg bg-red-600 px-4 py-3 active:opacity-70">
-    <Text class="font-semibold text-white">删除</Text>
-  </Button>
-</Dialog>
-```
-
 图层整层淡入淡出；想让卡片进场时稍微升起，给它一个入场样子和过渡：`startingClass="translate-y-1"`，`class` 里加 `transition-transform duration-200`。
-
 
 如果需要系统提示框或操作表，请使用 `nsh/base` 的 [`AlertDialog`](./alert-dialog.md)。
 
