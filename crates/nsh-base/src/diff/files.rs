@@ -175,6 +175,10 @@ pub(crate) struct FileSection {
     new_at: usize,
     /// The index of its first hunk header among all the files'.
     header_at: usize,
+    /// Its header in the patch's text, in bytes ([`FilePatch::header`]).
+    header_span: Range<usize>,
+    /// Each hunk's text in the patch's, in bytes ([`patch::PatchHunk::span`]).
+    hunk_spans: Vec<Range<usize>>,
 }
 
 /// A patch's files joined into two texts.
@@ -263,6 +267,8 @@ pub(crate) fn join(text: &str, language: Option<&str>) -> Joined {
             old_at,
             new_at,
             header_at,
+            header_span: file.header.clone(),
+            hunk_spans: file.hunks.iter().map(|h| h.span.clone()).collect(),
             model,
             old,
             new,
@@ -433,6 +439,35 @@ impl Files {
             .find(|f| (f.file.first_hunk..f.file.first_hunk + f.file.hunks).contains(&index))
     }
 
+    /// The patch of hunk header `gap` alone, out of `text` (the patch the
+    /// files are of): its file's header and its lines as they are there,
+    /// what `git apply` takes.
+    pub(crate) fn hunk_patch(&self, text: &str, gap: usize) -> Option<String> {
+        let f = self
+            .sections
+            .iter()
+            .find(|f| (f.header_at..f.header_at + f.hunk_spans.len()).contains(&gap))?;
+        let header = text.get(f.header_span.clone())?;
+        let hunk = text.get(f.hunk_spans[gap - f.header_at].clone())?;
+        let mut patch = String::with_capacity(header.len() + hunk.len() + 1);
+        patch.push_str(header);
+        patch.push_str(hunk);
+        if !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        Some(patch)
+    }
+
+    /// The index and path of the file joined line `line` of a side is in
+    /// (`old`: the old side).
+    pub(crate) fn file_of_line(&self, old: bool, line: usize) -> Option<(u32, SharedString)> {
+        let at = self
+            .sections
+            .partition_point(|f| if old { f.old_at } else { f.new_at } <= line);
+        let f = &self.sections[at.checked_sub(1)?];
+        Some((f.file.index, f.file.path.clone()))
+    }
+
     /// Gives `hunks` (of the joined model) their files, and their lines in
     /// their files' texts.
     pub(crate) fn localize(&self, hunks: &mut [DiffHunk]) {
@@ -575,6 +610,54 @@ rename to c.txt
 diff --git a/logo.png b/logo.png
 Binary files a/logo.png and b/logo.png differ
 ";
+
+    #[test]
+    fn a_hunk_s_patch_is_its_file_s_header_and_its_lines() {
+        let mut files = Files::default();
+        files.set(join(PATCH, None).sections);
+        assert_eq!(
+            files.hunk_patch(PATCH, 1).unwrap(),
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -20,2 +20,3 @@ fn b\n x\n+y\n z\n"
+        );
+        // A rename's header comes along, and the marker of a last line
+        // without a line break.
+        assert_eq!(
+            files.hunk_patch(PATCH, 2).unwrap(),
+            "diff --git a/b.txt b/c.txt\nsimilarity index 90%\nrename from b.txt\n\
+             rename to c.txt\n--- a/b.txt\n+++ b/c.txt\n@@ -1,2 +1,1 @@\n-gone\n kept\n\
+             \\ No newline at end of file\n"
+        );
+        assert_eq!(files.hunk_patch(PATCH, 3), None);
+    }
+
+    #[test]
+    fn a_hunk_s_patch_keeps_its_carriage_returns_and_ends_with_a_line_break() {
+        let patch = "--- a/w.txt\r\n+++ b/w.txt\r\n@@ -1 +1 @@\r\n-a\r\n+b\r";
+        let mut files = Files::default();
+        files.set(join(patch, None).sections);
+        assert_eq!(
+            files.hunk_patch(patch, 0).unwrap(),
+            "--- a/w.txt\r\n+++ b/w.txt\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n"
+        );
+    }
+
+    #[test]
+    fn a_joined_line_is_in_the_file_whose_lines_it_is() {
+        let mut files = Files::default();
+        files.set(join(PATCH, None).sections);
+        let of = |old, line| {
+            files
+                .file_of_line(old, line)
+                .map(|(i, p)| (i, p.to_string()))
+        };
+        // Old lines: a.rs 0..5, c.txt 5..7; new: a.rs 0..6, c.txt 6; the
+        // binary file has none.
+        assert_eq!(of(true, 4), Some((0, "a.rs".into())));
+        assert_eq!(of(true, 5), Some((1, "c.txt".into())));
+        assert_eq!(of(true, 6), Some((1, "c.txt".into())));
+        assert_eq!(of(false, 5), Some((0, "a.rs".into())));
+        assert_eq!(of(false, 6), Some((1, "c.txt".into())));
+    }
 
     #[test]
     fn files_join_with_their_lines_and_hunks_in_order() {

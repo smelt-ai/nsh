@@ -83,6 +83,17 @@ collapsed file first. Each file and side is highlighted on its own (`Segment`, a
 one file's syntax state never runs into the next; a frame's budget is shared among the files in view.
 `FilePatch::apply` applies a patch to the old file's text, giving the new one.
 
+The parse keeps where each file's header (`FilePatch::header`, its lines before its first hunk) and each hunk
+(`PatchHunk::span`) are in the patch's text, in bytes, and the state keeps the text: `hunkPatch(gap)` is the two
+cut out as they are (carriage returns and `\ No newline at end of file` kept, a line break added at the end), so an
+app stages or discards one change with `git apply` without parsing the patch again. `fileLine(side, line)` gives a
+joined line's file (the last whose `old_at` / `new_at` is at or before it: a file with no lines on a side starts where
+the next one does) and its number (`Side::number`).
+
+`patchUrl` takes the patch by a `blob:` URL: `BlobText`'s `from_js` reads the blob's bytes through
+`JsHost::blob` when the prop is set, so a patch a host call answered with as a `Blob` goes from the host to the view
+without becoming a JS string. Two values are equal when their URLs are, since a blob's bytes never change.
+
 ## The view
 
 The view is a vertical `Scroll` over a box of every row's height. In it sit the sides (two side by side for `split`,

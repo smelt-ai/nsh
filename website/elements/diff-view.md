@@ -89,6 +89,15 @@ const PATCH = `diff --git a/src/total.rs b/src/total.rs
 `language` names the language as the `Editor`'s does: a name, an alias, an extension or a file name (`"rust"`,
 `"tsx"`, `"main.go"`, `"Dockerfile"`).
 
+A large patch that the app only passes on, such as one a host call answered with as a `Blob`, goes in `patchUrl`
+instead: the `blob:` URL of `URL.createObjectURL`. The view reads the blob's bytes itself, so the text never takes up
+the app's heap. The app revokes the URL when it shows another patch.
+
+```tsx
+const url = URL.createObjectURL(blob);
+<DiffView patchUrl={url} class="flex-1" />;
+```
+
 ## Files of a patch
 
 A patch of several files shows each file under a header row: by default its path (`old → new` when renamed), its
@@ -273,6 +282,8 @@ changes nothing and logs a warning naming the method and the value.
 | `collapseFile(path)` | Shows only the header of the file at `path`. |
 | `expandFile(path)` | Shows the lines of the file at `path` again. |
 | `toggleFile(path)` | Collapses the file at `path`, or expands it when collapsed. |
+| `hunkPatch(gap)` | `Promise<string \| null>`: the patch of hunk header `gap` (a separator's) alone, its file's header and its lines as the patch has them: what `git apply` takes to stage or discard that change. `null` for two texts. |
+| `fileLine(side, line)` | `Promise<DiffFileLine \| null>`: where line `line` of `side` is in its file, `{ file, path, number }`: the file's index and path (empty for two texts) and the number the line shows, from 1. `null` past the side's lines. |
 | `hunkBounds()` | `Promise<DiffHunkBounds[]>`: where each change is in the rows, in order ([An overview ruler](#an-overview-ruler)). |
 | `scrollOffset()` | `Promise<Point>`: how far the rows are scrolled (`x` is 0). |
 | `setScrollOffset(offset)` | Scrolls the rows to `offset.y` at once, as far as they go, as a thumb follows the pointer that drags it. |
@@ -542,6 +553,7 @@ and the rows and sides grow with it.
 | `oldValue` | `.old_value(..)` | `string` | | The old text. |
 | `newValue` | `.new_value(..)` | `string` | | The new text. |
 | `patch` | `.patch(..)` | `string` | | A unified diff of one file or several, shown when `oldValue` and `newValue` are not set. |
+| `patchUrl` | `.patch_url(..)` | `string` | | A unified diff in a blob, by its `blob:` URL: shown as `patch`, read from the blob's bytes. Used when `patch` is not set either. |
 | `language` | `.language(..)` | `string` | plain text (a patch: each file's) | A language's name, alias, extension or file name. |
 | `layout` | `.layout(..)` | `"split" \| "unified"` | `"split"` | Side by side or one column. |
 | `inline` | `.inline(..)` | `"wordAlt" \| "word" \| "char" \| "none"` | `"wordAlt"` | What is highlighted within changed lines. |

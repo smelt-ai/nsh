@@ -26,6 +26,9 @@ pub(crate) struct FilePatch {
     pub(crate) copied: bool,
     /// How alike the old and new files are, in percent, for a rename or copy (`similarity index`).
     pub(crate) similarity: Option<u32>,
+    /// Its header in the patch's text, in bytes: its lines before its first hunk (`diff --git`, modes, `---` and
+    /// `+++`), which a hunk applied on its own goes under ([`PatchHunk::span`]).
+    pub(crate) header: std::ops::Range<usize>,
 }
 
 /// One hunk of a [`FilePatch`].
@@ -43,6 +46,8 @@ pub(crate) struct PatchHunk {
     pub(crate) header: String,
     /// The lines, in order.
     pub(crate) lines: Vec<PatchLine>,
+    /// Its text in the patch's, in bytes: the `@@` line to the end of its last line (its line break included).
+    pub(crate) span: std::ops::Range<usize>,
 }
 
 /// A line of a [`PatchHunk`], without its first character and its `\n`.
@@ -66,6 +71,15 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FilePatch>, String> {
     if text.ends_with('\n') {
         lines.pop();
     }
+    // Where each line starts in `text`, and where the line after the last
+    // ends.
+    let mut starts = Vec::with_capacity(lines.len() + 1);
+    let mut at = 0;
+    for line in &lines {
+        starts.push(at);
+        at += line.len() + 1;
+    }
+    starts.push(at.min(text.len()));
     let mut files: Vec<FilePatch> = Vec::new();
     // Whether the current file has a `diff --git` header: its names have
     // git's `a/` and `b/` prefixes.
@@ -75,7 +89,10 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FilePatch>, String> {
         let line = lines[i].strip_suffix('\r').unwrap_or(lines[i]);
         if let Some(names) = line.strip_prefix("diff --git ") {
             git = true;
-            let mut file = FilePatch::default();
+            let mut file = FilePatch {
+                header: starts[i]..starts[i],
+                ..FilePatch::default()
+            };
             if let Some((old, new)) = git_names(names) {
                 (file.old_path, file.new_path) = (Some(old), Some(new));
             }
@@ -98,7 +115,10 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FilePatch>, String> {
                 .is_none_or(|file| !file.hunks.is_empty() || !git)
             {
                 git = false;
-                files.push(FilePatch::default());
+                files.push(FilePatch {
+                    header: starts[i]..starts[i],
+                    ..FilePatch::default()
+                });
             }
             let next = lines[i + 1].strip_suffix('\r').unwrap_or(lines[i + 1]);
             let file = files.last_mut().expect("a file was just pushed");
@@ -107,8 +127,12 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FilePatch>, String> {
             i += 1;
         } else if line.starts_with("@@ ") {
             if files.is_empty() {
-                files.push(FilePatch::default());
+                files.push(FilePatch {
+                    header: starts[i]..starts[i],
+                    ..FilePatch::default()
+                });
             }
+            let first = i;
             let header_line = i + 1;
             let mut hunk = hunk_header(line).map_err(|error| format!("line {}: {error}", i + 1))?;
             let (mut old_left, mut new_left) = (hunk.old_count, hunk.new_count);
@@ -147,7 +171,12 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FilePatch>, String> {
             if old_left > 0 || new_left > 0 {
                 return Err(format!("line {}: the hunk {line:?} ends early", i + 1));
             }
-            files.last_mut().expect("a file exists").hunks.push(hunk);
+            hunk.span = starts[first]..starts[i + 1];
+            let file = files.last_mut().expect("a file exists");
+            if file.hunks.is_empty() {
+                file.header.end = starts[first];
+            }
+            file.hunks.push(hunk);
         }
         i += 1;
     }
@@ -477,6 +506,7 @@ fn hunk_header(line: &str) -> Result<PatchHunk, String> {
         new_count,
         header: header.strip_prefix(' ').unwrap_or(header).to_string(),
         lines: Vec::new(),
+        span: 0..0,
     })
 }
 

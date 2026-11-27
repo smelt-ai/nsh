@@ -879,6 +879,58 @@ fn slot_content_lays_out_in_the_components_layout() {
     assert_eq!(text.0, 8.0, "in the holder's padding");
 }
 
+const DIFF_BLOB: &str = r#"import { mount, signal, Text, View } from "nsh";
+import { DiffView, type DiffViewRef } from "nsh/base";
+
+const patch =
+  "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10,2 +10,2 @@\n one\n-two\n+TWO\n" +
+  "diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -5 +5 @@\n-x\n+y\n";
+const url = URL.createObjectURL(new Blob([patch]));
+const shown = signal("waiting");
+let view!: DiffViewRef;
+setTimeout(async () => {
+  const files = (await view.files()).map((f) => f.path).join(",");
+  const hunk = await view.hunkPatch(1);
+  const line = await view.fileLine("new", 2);
+  const past = await view.fileLine("new", 3);
+  shown.set(`got ${files} | ${JSON.stringify(hunk)} | ${line?.path}:${line?.number} | ${past}`);
+}, 0);
+
+mount(() => (
+  <View>
+    <DiffView ref={view} patchUrl={url} style={{ height: 300 }} />
+    <Text>{shown()}</Text>
+  </View>
+));
+"#;
+
+/// A patch given by a `blob:` URL shows as one given as text, and the ref
+/// cuts a hunk's patch out of it and finds a line's file and number.
+#[test]
+fn a_diff_view_reads_its_patch_from_a_blob() {
+    let (_engine, rx) = start(DIFF_BLOB);
+    let mut got = None;
+    while let Ok(batch) = rx.recv_timeout(Duration::from_secs(2)) {
+        for item in batch.items {
+            if let MountItem::Text { text, .. } = item
+                && text.text.starts_with("got")
+            {
+                got = Some(text.text.clone());
+            }
+        }
+        if got.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some(
+            "got a.rs,b.rs | \"diff --git a/b.rs b/b.rs\\n--- a/b.rs\\n+++ b/b.rs\\n@@ -5 +5 @@\\n-x\\n+y\\n\" \
+             | b.rs:5 | null"
+        )
+    );
+}
+
 const METHODS: &str = r#"import { mount, signal, Text, View } from "nsh";
 import { Stepper, type StepperRef } from "test/ui";
 

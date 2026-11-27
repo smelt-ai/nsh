@@ -14,7 +14,10 @@ mod patch;
 mod review;
 mod view;
 
-use nsh_core::prelude::*;
+use nsh_core::{
+    element::{JsHost, JsIn, JsOwned, JsValue, PropError, TsTypes},
+    prelude::*,
+};
 pub use parts::{DiffViewClasses, DiffViewPart, DiffViewStyles};
 
 use self::controller::Dv;
@@ -195,6 +198,64 @@ pub struct DiffAnnotation {
     pub line: u32,
 }
 
+/// Where a line of a [`DiffView`] is in its file (`fileLine`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, JsObject)]
+#[non_exhaustive]
+pub struct DiffFileLine {
+    /// The index of its file in `files()` (0 for two texts).
+    pub file: u32,
+    /// Its file's path (empty for two texts).
+    pub path: SharedString,
+    /// Its number in the file, from 1: the one it shows.
+    pub number: u32,
+}
+
+/// A text a prop takes by a `blob:` URL (`URL.createObjectURL`): the
+/// blob's bytes, as UTF-8, read when the prop is set, so a large text
+/// goes to the view without going through the app's heap (`patchUrl`). A
+/// URL no blob has (revoked, never made) is an empty text.
+#[derive(Debug, Clone, Default)]
+pub struct BlobText {
+    /// The URL.
+    pub url: SharedString,
+    /// The blob's text.
+    pub text: SharedString,
+}
+
+impl PartialEq for BlobText {
+    /// A blob's bytes never change: the same URL is the same text.
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+    }
+}
+
+impl JsValue for BlobText {
+    fn ts_type(_types: &mut TsTypes) -> String {
+        "string".into()
+    }
+
+    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
+        let url = value
+            .as_string()
+            .ok_or_else(|| value.expected("a blob: URL"))?;
+        let text = match value.host().blob(&url) {
+            Some((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
+            None => {
+                log::warn!("DiffView: no blob has the URL {url}");
+                String::new()
+            }
+        };
+        Ok(BlobText {
+            url: url.into(),
+            text: text.into(),
+        })
+    }
+
+    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
+        self.url.to_js(host)
+    }
+}
+
 /// How a file of a [`DiffView`]'s patch changed, in git's terms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PropEnum)]
 pub enum DiffFileStatus {
@@ -258,6 +319,11 @@ pub struct DiffViewProps {
     /// (`renderFileHeader`). Used when `oldValue` and `newValue` are not
     /// set.
     pub patch: Prop<Option<SharedString>>,
+    /// A unified diff in a blob, by its `blob:` URL
+    /// (`URL.createObjectURL`): shown as `patch` is, its bytes read from
+    /// the blob, so a large patch never goes through the app's heap. Used
+    /// when `patch` is not set either.
+    pub patch_url: Prop<Option<BlobText>>,
     /// The language, as the editor's `language` (a name, an extension or a
     /// file name); default plain text (with a `patch`, its file's).
     pub language: Prop<Option<SharedString>>,
@@ -470,6 +536,19 @@ impl DiffViewApi {
     /// texts).
     pub fn files(&self) -> Vec<DiffFile> {
         self.dv.files()
+    }
+
+    /// The patch of hunk header `gap` (a separator's) alone: its file's
+    /// header and its lines as the patch has them, what `git apply`
+    /// takes. `null` for two texts or a gap the patch does not have.
+    pub fn hunk_patch(&self, gap: u32) -> Option<String> {
+        self.dv.hunk_patch(gap as usize)
+    }
+
+    /// Where line `line` of `side` is in its file: the file and the
+    /// number the line shows. `null` for a line past the side's.
+    pub fn file_line(&self, side: DiffSide, line: u32) -> Option<DiffFileLine> {
+        self.dv.file_line(side, line as usize)
     }
 
     /// Scrolls the header of the file at `path` (its `path`) to the top.

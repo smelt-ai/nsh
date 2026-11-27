@@ -279,10 +279,10 @@ pub use crate::{
 #[cfg(feature = "editor")]
 pub use crate::{
     diff::{
-        DiffAnnotation, DiffChange, DiffExpand, DiffFile, DiffFileStatus, DiffHunk, DiffHunkBounds,
-        DiffIndicators, DiffInline, DiffLayout, DiffLine, DiffLineRange, DiffSeparator, DiffSide,
-        DiffStats, DiffView, DiffViewApi, DiffViewClasses, DiffViewElement, DiffViewEvent,
-        DiffViewPart, DiffViewProps, DiffViewStyles, diff_view,
+        BlobText, DiffAnnotation, DiffChange, DiffExpand, DiffFile, DiffFileLine, DiffFileStatus,
+        DiffHunk, DiffHunkBounds, DiffIndicators, DiffInline, DiffLayout, DiffLine, DiffLineRange,
+        DiffSeparator, DiffSide, DiffStats, DiffView, DiffViewApi, DiffViewClasses,
+        DiffViewElement, DiffViewEvent, DiffViewPart, DiffViewProps, DiffViewStyles, diff_view,
     },
     editor::{
         Editor, EditorApi, EditorBounds, EditorClasses, EditorCommand, EditorContextMenuEvent,

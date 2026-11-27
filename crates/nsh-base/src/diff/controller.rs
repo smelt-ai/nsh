@@ -12,8 +12,8 @@ use nsh_core::prelude::*;
 use ropey::Rope;
 
 use super::{
-    DiffAnnotation, DiffChange, DiffExpand, DiffFile, DiffHunk, DiffInline, DiffLayout,
-    DiffLineRange, DiffSide, DiffStats, DiffViewEvent, DiffViewProps,
+    DiffAnnotation, DiffChange, DiffExpand, DiffFile, DiffFileLine, DiffHunk, DiffInline,
+    DiffLayout, DiffLineRange, DiffSide, DiffStats, DiffViewEvent, DiffViewProps,
     files::{self, Files, Joined, Segment},
     geometry::{self, Geometry},
     layout::{self, Expansions, Header, Layout, Options, Row},
@@ -159,6 +159,9 @@ pub(crate) struct State {
     headers: Vec<Header>,
     /// Whether the texts are a patch's (only its hunks' lines).
     pub(crate) patch: bool,
+    /// The patch the files are of (empty for two texts): what
+    /// `hunkPatch` cuts a hunk's patch from.
+    source: SharedString,
     pub(crate) font: Font,
     /// The width of a column.
     pub(crate) column: Points,
@@ -205,6 +208,7 @@ impl State {
             expansions: Expansions::default(),
             headers: Vec::new(),
             patch: false,
+            source: SharedString::default(),
             font,
             column,
             syntax: Syntax::Plain,
@@ -230,6 +234,7 @@ impl State {
         self.old = Side::new(old, numbers.0);
         self.new = Side::new(new, numbers.1);
         self.patch = !headers.is_empty();
+        self.source = SharedString::default();
         self.headers = headers;
         self.expansions.clear();
         self.inline.clear();
@@ -238,8 +243,8 @@ impl State {
         self.make_highlighters();
     }
 
-    /// Shows a patch's files, joined.
-    fn set_patch(&mut self, joined: Joined) {
+    /// Shows the files of patch `source`, joined.
+    fn set_patch(&mut self, source: SharedString, joined: Joined) {
         let Joined {
             old,
             new,
@@ -257,6 +262,7 @@ impl State {
         // Each file's hunk headers are its section's.
         self.headers = Vec::new();
         self.patch = true;
+        self.source = source;
         self.expansions.clear();
         self.inline.clear();
         self.pairs.clear();
@@ -495,6 +501,26 @@ impl State {
             .entry((old, new))
             .or_insert_with(|| DiffModel::inline(o, n, mode))
             .clone()
+    }
+
+    /// The patch of hunk header `gap` alone (`hunkPatch`).
+    pub(crate) fn hunk_patch(&self, gap: usize) -> Option<String> {
+        self.files.hunk_patch(&self.source, gap)
+    }
+
+    /// Where line `line` of `side` is in its file (`fileLine`).
+    pub(crate) fn file_line(&self, side: DiffSide, line: usize) -> Option<DiffFileLine> {
+        let old = side == DiffSide::Old;
+        let text = if old { &self.old } else { &self.new };
+        if line >= text.lines() {
+            return None;
+        }
+        let (file, path) = self.files.file_of_line(old, line).unwrap_or_default();
+        Some(DiffFileLine {
+            file,
+            path,
+            number: text.number(line) as u32,
+        })
     }
 
     /// The hunks, as the ref gives them.
@@ -837,7 +863,11 @@ impl Dv {
         effect(move || {
             let old = dv.props.old_value.get();
             let new = dv.props.new_value.get();
-            let patch_text = dv.props.patch.get();
+            let patch_text = dv
+                .props
+                .patch
+                .get()
+                .or_else(|| dv.props.patch_url.get().map(|blob| blob.text));
             let language = dv.props.language.get();
             {
                 let mut st = dv.st.borrow_mut();
@@ -846,7 +876,7 @@ impl Dv {
                         let joined = files::join(&text, language.as_ref().map(|l| l.as_str()));
                         let name = language.map(|l| l.to_string()).or(joined.path.clone());
                         st.syntax = languages::resolve(name.as_deref().unwrap_or("")).1;
-                        st.set_patch(joined);
+                        st.set_patch(text, joined);
                     }
                     (old, new, _) => {
                         let name = language.map(|l| l.to_string());
@@ -1069,6 +1099,14 @@ impl Dv {
 
     pub(crate) fn files(&self) -> Vec<DiffFile> {
         self.st.borrow().files.list()
+    }
+
+    pub(crate) fn hunk_patch(&self, gap: usize) -> Option<String> {
+        self.st.borrow().hunk_patch(gap)
+    }
+
+    pub(crate) fn file_line(&self, side: DiffSide, line: usize) -> Option<DiffFileLine> {
+        self.st.borrow().file_line(side, line)
     }
 
     /// Collapses, expands or toggles (`None`) the file at `path`, and

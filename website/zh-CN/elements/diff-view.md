@@ -73,6 +73,13 @@ const PATCH = `diff --git a/src/total.rs b/src/total.rs
 
 `language` 的写法与 `Editor` 相同：名称、别名、扩展名或文件名（`"rust"`、`"tsx"`、`"main.go"`、`"Dockerfile"`）。
 
+应用只是转交的大补丁（比如宿主调用以 `Blob` 回复的），改用 `patchUrl` 传入：`URL.createObjectURL` 给出的 `blob:` 地址。视图自己读 blob 的字节，正文不占应用的堆。应用换显示别的补丁时撤销这个地址。
+
+```tsx
+const url = URL.createObjectURL(blob);
+<DiffView patchUrl={url} class="flex-1" />;
+```
+
 <a id="files-of-a-patch"></a>
 
 ## 补丁中的文件
@@ -239,6 +246,8 @@ function Proposal(props: { file: string; current: string; proposed: string; onAp
 | `collapseFile(path)` | 只显示路径为 `path` 的文件的标题。 |
 | `expandFile(path)` | 重新显示路径为 `path` 的文件的行。 |
 | `toggleFile(path)` | 折叠路径为 `path` 的文件，已折叠时则展开它。 |
+| `hunkPatch(gap)` | `Promise<string \| null>`：hunk 标题 `gap`（分隔行的 `gap`）单独成的补丁，即它所在文件的文件头加上它在补丁里的原样各行，可直接交给 `git apply` 暂存或丢弃这处改动。两段文本时为 `null`。 |
+| `fileLine(side, line)` | `Promise<DiffFileLine \| null>`：`side` 的第 `line` 行在它文件中的位置 `{ file, path, number }`：文件的序号和路径（两段文本时为空），以及该行显示的行号（从 1 起）。超出该侧的行数时为 `null`。 |
 | `hunkBounds()` | `Promise<DiffHunkBounds[]>`：每处改动在行中的位置，按顺序（见[概览标尺](#an-overview-ruler)）。 |
 | `scrollOffset()` | `Promise<Point>`：行滚动了多远（`x` 为 0）。 |
 | `setScrollOffset(offset)` | 立即把行滚动到 `offset.y`（最多滚到行的末尾），就像拖动的滑块跟随指针那样。 |
@@ -489,6 +498,7 @@ const drafting = signal<DiffLineRange | null>(null);
 | `oldValue` | `.old_value(..)` | `string` | | 旧文本。 |
 | `newValue` | `.new_value(..)` | `string` | | 新文本。 |
 | `patch` | `.patch(..)` | `string` | | 一个或多个文件的统一 diff，在未设置 `oldValue` 和 `newValue` 时显示。 |
+| `patchUrl` | `.patch_url(..)` | `string` | | blob 里的统一 diff，用它的 `blob:` 地址传入：显示方式与 `patch` 相同，从 blob 的字节读取。`patch` 也未设置时使用。 |
 | `language` | `.language(..)` | `string` | 纯文本（补丁：每个文件的语言） | 语言的名称、别名、扩展名或文件名。 |
 | `layout` | `.layout(..)` | `"split" \| "unified"` | `"split"` | 并排或一列。 |
 | `inline` | `.inline(..)` | `"wordAlt" \| "word" \| "char" \| "none"` | `"wordAlt"` | 改动行内高亮的内容。 |
