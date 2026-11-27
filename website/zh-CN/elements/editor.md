@@ -57,6 +57,26 @@ fn code() -> impl IntoElement {
 
 - **受控**：传入 `value`，并在 `onChange` 中重新设置它，`onChange` 报告完整的新文本。应用修改的 `value`（加载了文件、格式化工具的输出）会作为一次可撤销的编辑替换文本，远离修改处的光标和折叠保持原位。
 - **非受控**：传入 `defaultValue`，从 `onChange` 或 ref 的 `value()` 读取文本。
+- **经 blob**：应用只是转交的大文件（比如宿主调用以 `Blob` 回复的）用 `valueUrl` 传入 `URL.createObjectURL` 给出的 `blob:` 地址，每次改动以 `Blob` 交出（`onBlobChange`）：正文不经过应用的堆。换新地址时像 `value` 一样替换文本。用 `savedValueUrl` 传入已保存文本的地址，`onModifiedChange` 报告文本是否与它不同（撤销回去也算），应用不用自己比较文本就知道有没有未保存的改动。
+
+```tsx
+const [opened, saved] = [URL.createObjectURL(file), signal(URL.createObjectURL(file))];
+const dirty = signal(false);
+let edited = file;
+
+<Editor
+  valueUrl={opened}
+  savedValueUrl={saved()}
+  onBlobChange={({ blob }) => (edited = blob)}
+  onModifiedChange={({ modified }) => dirty.set(modified)}
+/>;
+
+async function save() {
+  const blob = edited;
+  await host.call("save", { text: blob }); // 宿主收到的是 blob 的文本
+  saved.set(URL.createObjectURL(blob));
+}
+```
 
 换行符是 `\n`：传入文本中的 `\r\n` 和 `\r` 都变成 `\n`。
 
@@ -650,6 +670,8 @@ let editor!: EditorRef;
 |---|---|---|---|---|
 | `value` | `.value(..)` | `string` | | 文本，由应用控制（在 `onChange` 中重新设置）。 |
 | `defaultValue` | `.default_value(..)` | `string` | | 编辑器自己保存文本时的初始文本。 |
+| `valueUrl` | `.value_url(..)` | `string` | | blob 里的文本，用它的 `blob:` 地址传入，代替 `value`：换新地址时像 `value` 一样替换文本。 |
+| `savedValueUrl` | `.saved_value_url(..)` | `string` | | blob 里的已保存文本，用它的 `blob:` 地址传入：`onModifiedChange` 拿文本和它比较。 |
 | `language` | `.language(..)` | `string` | 纯文本 | 语言的名称、别名、扩展名或文件名（[语言](#languages)）。 |
 | `placeholder` | `.placeholder(..)` | `string` | | 文本为空时显示。 |
 | `readOnly` | `.read_only(..)` | `boolean` | `false` | 文本可以选择和复制，不能修改。 |
@@ -694,6 +716,8 @@ let editor!: EditorRef;
 |---|---|---|
 | `onChange` | `.on_change(\|value: &SharedString\| ..)` | 文本改变了：`{ value }`，完整的新文本。 |
 | `onSelectionChange` | `.on_selection_change(\|selections: &Vec<EditorSelection>\| ..)` | 选区改变了：`{ selections }`，所有选区，主选区在最后。 |
+| `onBlobChange` | `.on_blob_change(\|blob: &EditorTextBlob\| ..)` | 文本改变了，以 `Blob`（UTF-8）代替 `onChange` 的字符串：`{ blob }`，不经过应用的堆。 |
+| `onModifiedChange` | `.on_modified_change(\|modified: &bool\| ..)` | 文本是否与 `savedValueUrl` 的不同变了：`{ modified }`；每换一个已保存文本都报告一次。 |
 | `onFocus`、`onBlur` | `.on_focus(\|\| ..)`、`.on_blur(\|\| ..)` | 编辑器获得或失去焦点。 |
 | `onSearchChange` | `.on_search_change(\|result: &EditorSearchResult\| ..)` | 搜索的匹配项改变了：`{ result }`，即 `{ count, current, error }`。 |
 | `onLineNumberPress` | `.on_line_number_press(\|line: &u32\| ..)` | 行号被点击：`{ line }`，行号，从 0 开始。 |

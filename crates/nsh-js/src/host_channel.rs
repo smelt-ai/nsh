@@ -106,8 +106,8 @@ fn name_arg(cx: Ctx, v: Raw, what: &str) -> R<String> {
     Ok(name)
 }
 
-/// `v` as JSON (`undefined`: `null`); throws a `RangeError` for data
-/// nested too deep or too large.
+/// `v` as JSON (`undefined`: `null`, a `Blob`: its text); throws a
+/// `RangeError` for data nested too deep or too large.
 fn to_json(cx: Ctx, v: Raw) -> R<JsonValue> {
     if js::is_undefined(v) {
         return Ok(JsonValue::Null);
@@ -115,7 +115,7 @@ fn to_json(cx: Ctx, v: Raw) -> R<JsonValue> {
     // SAFETY: a context reference and a dup for the converter.
     let rcx = unsafe { rquickjs::Ctx::from_raw(std::ptr::NonNull::new_unchecked(cx)) };
     let value = unsafe { rquickjs::Value::from_raw(rcx, qjs::JS_DupValue(cx, v)) };
-    crate::protocol::to_json(&value).map_err(|_| Throw)
+    crate::protocol::to_json_with_blobs(&value).map_err(|_| Throw)
 }
 
 /// JSON as a JS value.
@@ -572,7 +572,9 @@ export type HostParams = { readonly [key: string]: HostValue };
 /** The channel to the app this one is embedded in (the iOS, Android and
  * desktop SDKs' `NshAppView`, `NshView` and `AppView`). Data crosses as JSON
  * values: what `JSON.stringify` keeps of it (functions and `undefined`
- * fields are left out). */
+ * fields are left out), except that a `Blob` the app sends goes as its text
+ * (UTF-8), its bytes read without going through the heap (a large text the
+ * app holds as a blob, as an editor's `valueBlob()`). */
 export interface HostEvents {
   /** Whether the platform or native SDK has a configured host. */
   available(): boolean;

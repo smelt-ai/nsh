@@ -179,6 +179,13 @@ impl Buffer {
         self.rope.len_bytes() == 0
     }
 
+    /// Whether the text is `other` (one made by [`text_rope`]). Texts of
+    /// different lengths differ at once; equal lengths compare chunk by
+    /// chunk.
+    pub(crate) fn is_text(&self, other: &Rope) -> bool {
+        self.rope.len_bytes() == other.len_bytes() && self.rope == *other
+    }
+
     /// Grows with every change (edits, undo, redo, reset).
     pub(crate) fn version(&self) -> u64 {
         self.version
@@ -709,6 +716,12 @@ fn is_word_char(c: char) -> bool {
 }
 
 /// `text` with `\r\n` and `\r` turned into `\n`.
+/// `text` as a buffer holds it (line breaks normalized), to compare a
+/// buffer's text with ([`Buffer::is_text`]).
+pub(crate) fn text_rope(text: &str) -> Rope {
+    Rope::from_str(&normalize(text))
+}
+
 fn normalize(text: &str) -> Cow<'_, str> {
     if !text.contains('\r') {
         return Cow::Borrowed(text);

@@ -33,10 +33,14 @@ pub struct TextViewProps {
     /// by an AI model can be passed as it grows (with `options={{
     /// streaming: true }}`): only the blocks that changed are shown again.
     pub markdown: Prop<Option<SharedString>>,
+    /// The document as Markdown by a `blob:` URL (`URL.createObjectURL`),
+    /// when `markdown` is not given: a large file shows without going
+    /// through the app's heap.
+    pub markdown_url: Prop<Option<crate::BlobText>>,
     /// The document as HTML (simple markup as a reader shows it: no CSS or
-    /// scripts), when `markdown` is not given.
+    /// scripts), when no Markdown is given.
     pub html: Prop<Option<SharedString>>,
-    /// The document as blocks the app made, when neither `markdown` nor
+    /// The document as blocks the app made, when neither Markdown nor
     /// `html` is given.
     pub document: Prop<Option<Document>>,
     /// The Markdown syntax read beyond CommonMark and GitHub's.
@@ -189,7 +193,13 @@ impl TextViewApi {
         if reported.text.is_empty() {
             return String::new();
         }
-        let source = if let Some(md) = self.props.markdown.get_untracked() {
+        let markdown = self.props.markdown.get_untracked().or_else(|| {
+            self.props
+                .markdown_url
+                .get_untracked()
+                .map(|blob| blob.text)
+        });
+        let source = if let Some(md) = markdown {
             Source::Markdown(md.to_string())
         } else if let Some(html) = self.props.html.get_untracked() {
             Source::Html(html.to_string())
@@ -321,7 +331,11 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
                 .extensions(props.extensions.get())
                 .plugins(&parser_plugins)
         };
-        if let Some(markdown) = props.markdown.get() {
+        let markdown = props
+            .markdown
+            .get()
+            .or_else(|| props.markdown_url.get().map(|blob| blob.text));
+        if let Some(markdown) = markdown {
             parse_reveal.sync_source(Some(&markdown), props.streaming_fade.get_untracked());
             return read.borrow_mut().parse(&parser(), &markdown);
         }

@@ -104,6 +104,8 @@ const off = host.on("ping", (d) => say(`ping ${d}`));
 host.on("stop", () => off());
 
 host.call("echo", { n: 1 }).then((v: any) => say(`echo ${v.got.n}`));
+// A blob goes as its text.
+host.call("echo", { text: new Blob(["h\u00e9llo"]) }).then((v: any) => say(`blob ${v.got.text}`));
 host.call("fail").catch((e) => say(`fail ${e instanceof Error} ${e.code} ${e.message}`));
 host.call("missing").catch((e) => say(`missing ${e.code} ${e.message}`));
 host.call("dropped").catch((e) => say(`dropped ${e.code} ${e.message}`));
@@ -154,6 +156,7 @@ fn the_app_and_its_host_talk() {
             "params c-42 object",
             "early 1",
             "echo 1",
+            "blob h\u{e9}llo",
             "fail true ERR_NSH_HOST_ERROR nope",
             "missing ERR_NSH_HOST_ERROR host.call(\"missing\"): the embedding app handles no \"missing\"",
             "dropped ERR_NSH_HOST_ERROR host.call(\"dropped\"): the embedding app did not answer",

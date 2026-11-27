@@ -57,6 +57,7 @@ pub use highlighter::{
 pub use hooks::{EditorBounds, EditorHoverEvent, EditorTextPressEvent};
 pub use languages::{EditorLanguage, register_highlighter, register_language};
 pub use layout::EditorScrollBeyond;
+use nsh_core::element::{JsHost, JsIn, JsOwned, PropError, TsTypes};
 use nsh_core::prelude::*;
 pub use parts::{EditorClasses, EditorPart, EditorStyles};
 pub use touch::EditorRect;
@@ -77,6 +78,16 @@ pub struct EditorProps {
     pub value: Prop<Option<SharedString>>,
     /// The first text, when the editor keeps its own.
     pub default_value: Prop<Option<SharedString>>,
+    /// The text by a `blob:` URL (`URL.createObjectURL`), in place of
+    /// `value`: a large file goes to the editor without going through the
+    /// app's heap. A new URL replaces the text as `value` does; the app
+    /// reads the text with `valueBlob()` rather than from `onChange`.
+    pub value_url: Prop<Option<crate::BlobText>>,
+    /// The text as last saved, by a `blob:` URL: the editor tells whether
+    /// its text is another (`onModifiedChange`), so the app knows what is
+    /// unsaved without comparing the texts itself. Line breaks compare as
+    /// the editor holds them (`\r\n` as `\n`).
+    pub saved_value_url: Prop<Option<crate::BlobText>>,
     /// The language: a name (`"rust"`, `"typescript"`), an extension
     /// (`"tsx"`) or a file name (`"main.go"`, `"Dockerfile"`). It decides
     /// the highlighting, comments, brackets and indentation (default plain
@@ -204,15 +215,54 @@ pub struct EditorProps {
     pub inline_completion_delay: Prop<f64>,
 }
 
+/// An editor's text as a `Blob` of `text/plain;charset=utf-8` (`\r\n`
+/// came in as `\n`), for `onBlobChange`: its bytes are made in Rust when a
+/// handler takes it, never in the app's heap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorTextBlob(pub(crate) ropey::Rope);
+
+impl JsValue for EditorTextBlob {
+    fn ts_type(_types: &mut TsTypes) -> String {
+        "Blob".into()
+    }
+
+    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
+        Err(value.expected("no value: an editor's text blob goes only to the app"))
+    }
+
+    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
+        let mut bytes = Vec::with_capacity(self.0.len_bytes());
+        for chunk in self.0.chunks() {
+            bytes.extend_from_slice(chunk.as_bytes());
+        }
+        let bytes = nsh_core::ImageData::from(bytes);
+        Ok(JsOwned::new(
+            host,
+            host.new_blob(&bytes, "text/plain;charset=utf-8")?,
+        ))
+    }
+}
+
 /// The events of an [`Editor`].
 #[derive(Debug, Clone, PartialEq, Event)]
 pub enum EditorEvent {
     /// The text changed (the whole new text).
     #[args(value)]
     Change(SharedString),
+    /// The text changed, as a `Blob` in place of `onChange`'s string: what
+    /// an app keeps of a large file without taking it into its heap, to
+    /// save it (`host.call` takes the blob as its text) or give it back by
+    /// `valueUrl`.
+    #[args(blob)]
+    BlobChange(EditorTextBlob),
     /// The selections changed: every one, the primary (newest) last.
     #[args(selections)]
     SelectionChange(Vec<EditorSelection>),
+    /// Whether the text is other than the saved one (`savedValueUrl`)
+    /// changed: by an edit, an undo or redo, or a new saved text. Undoing
+    /// back to the saved text is unmodified again.
+    #[args(modified)]
+    ModifiedChange(bool),
     /// The editor took the focus.
     Focus,
     /// The editor lost the focus.

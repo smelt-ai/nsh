@@ -68,6 +68,30 @@ width.
   changes (a file loaded, a formatter's output) replaces the text as one edit undo takes back, and the carets and
   folds away from what changed stay where they are.
 - **Uncontrolled**: pass `defaultValue` and read the text from `onChange` or the ref's `value()`.
+- **By blob**: a large file the app only passes on (one a host call answered with as a `Blob`) goes in `valueUrl`,
+  the `blob:` URL `URL.createObjectURL` gives, and comes out as a `Blob` at each edit (`onBlobChange`): the text never
+  goes through the app's heap. A new URL replaces the text as `value` does. Give the saved text's URL in `savedValueUrl` and
+  `onModifiedChange` reports whether the text is another, undoing back to it included, so the app knows what is
+  unsaved without comparing texts.
+
+```tsx
+const [opened, saved] = [URL.createObjectURL(file), signal(URL.createObjectURL(file))];
+const dirty = signal(false);
+let edited = file;
+
+<Editor
+  valueUrl={opened}
+  savedValueUrl={saved()}
+  onBlobChange={({ blob }) => (edited = blob)}
+  onModifiedChange={({ modified }) => dirty.set(modified)}
+/>;
+
+async function save() {
+  const blob = edited;
+  await host.call("save", { text: blob }); // the host gets the blob's text
+  saved.set(URL.createObjectURL(blob));
+}
+```
 
 Line breaks are `\n`: `\r\n` and `\r` in a text that comes in become `\n`.
 
@@ -756,6 +780,8 @@ with the user's text size (`fontScale()`), and the rows grow with it.
 |---|---|---|---|---|
 | `value` | `.value(..)` | `string` | | The text, controlled by the app (set it again from `onChange`). |
 | `defaultValue` | `.default_value(..)` | `string` | | The first text, when the editor keeps its own. |
+| `valueUrl` | `.value_url(..)` | `string` | | The text in a blob, by its `blob:` URL, in place of `value`: a new URL replaces the text as `value` does. |
+| `savedValueUrl` | `.saved_value_url(..)` | `string` | | The saved text in a blob, by its `blob:` URL: what `onModifiedChange` compares the text with. |
 | `language` | `.language(..)` | `string` | plain text | A language's name, alias, extension or file name ([Languages](#languages)). |
 | `placeholder` | `.placeholder(..)` | `string` | | Shown while the text is empty. |
 | `readOnly` | `.read_only(..)` | `boolean` | `false` | The text is selected and copied, not changed. |
@@ -798,6 +824,8 @@ with the user's text size (`fontScale()`), and the rows grow with it.
 |---|---|---|
 | `onChange` | `.on_change(\|value: &SharedString\| ..)` | The text changed: `{ value }`, the whole new text. |
 | `onSelectionChange` | `.on_selection_change(\|selections: &Vec<EditorSelection>\| ..)` | The selections changed: `{ selections }`, every one, the primary last. |
+| `onBlobChange` | `.on_blob_change(\|blob: &EditorTextBlob\| ..)` | The text changed, as a `Blob` (UTF-8) in place of `onChange`'s string: `{ blob }`, made without going through the app's heap. |
+| `onModifiedChange` | `.on_modified_change(\|modified: &bool\| ..)` | Whether the text is other than `savedValueUrl`'s changed: `{ modified }`; told once for each new saved text. |
 | `onFocus`, `onBlur` | `.on_focus(\|\| ..)`, `.on_blur(\|\| ..)` | The editor took or lost the focus. |
 | `onSearchChange` | `.on_search_change(\|result: &EditorSearchResult\| ..)` | The search's matches changed: `{ result }`, a `{ count, current, error }`. |
 | `onLineNumberPress` | `.on_line_number_press(\|line: &u32\| ..)` | A line number was pressed: `{ line }`, the line, from 0. |

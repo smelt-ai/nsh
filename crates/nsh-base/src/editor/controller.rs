@@ -118,6 +118,10 @@ pub(crate) struct Ed {
     line_copy: Rc<RefCell<Option<String>>>,
     /// Whether a highlighting pass is scheduled.
     highlighting: Rc<Cell<bool>>,
+    /// A report of `onModifiedChange` waits for the end of the turn
+    /// (`Some`, with whether to tell it whatever it was), so the props of one
+    /// update (a new text and saved text together) are told as one.
+    modified_report: Rc<Cell<Option<bool>>>,
     pub(crate) vscroll: ElementRef,
     pub(crate) hscroll: ElementRef,
     pub(crate) input: ElementRef,
@@ -162,6 +166,7 @@ impl Ed {
         let text = props
             .value
             .get_untracked()
+            .or_else(|| props.value_url.get_untracked().map(|blob| blob.text))
             .or_else(|| props.default_value.get_untracked())
             .unwrap_or_default();
         let name = props.language.get_untracked();
@@ -192,6 +197,7 @@ impl Ed {
             drag: Rc::default(),
             line_copy: Rc::default(),
             highlighting: Rc::default(),
+            modified_report: Rc::default(),
             vscroll: element_ref(),
             hscroll: element_ref(),
             input: element_ref(),
@@ -227,6 +233,27 @@ impl Ed {
             let value = ed.props.value.get();
             if let Some(value) = value {
                 ed.take_value(&value);
+            }
+        });
+        let ed = self.clone();
+        effect(move || {
+            if let Some(blob) = ed.props.value_url.get() {
+                ed.take_value(&blob.text);
+            }
+        });
+        let ed = self.clone();
+        effect(move || {
+            let saved = ed.props.saved_value_url.get();
+            let tracked = saved.is_some();
+            {
+                let mut st = ed.st.borrow_mut();
+                st.saved = saved.map(|blob| super::buffer::text_rope(&blob.text));
+                st.modified = false;
+            }
+            // A new saved text is told once whatever it was, so the app
+            // never keeps a state from before it.
+            if tracked {
+                ed.report_modified(true);
             }
         });
         let ed = self.clone();
@@ -397,6 +424,7 @@ impl Ed {
             st.reported = Some((st.buffer.version(), value.to_owned().into()));
             changes
         };
+        self.report_modified(false);
         if !changes.is_empty() {
             self.bump_text();
             self.bump_selection();
@@ -1411,7 +1439,7 @@ impl Ed {
     // Reports.
 
     fn report_text(&self) {
-        let text = {
+        let (text, rope) = {
             let mut st = self.st.borrow_mut();
             let version = st.buffer.version();
             if st.reported.as_ref().is_some_and(|(v, _)| *v == version) {
@@ -1419,9 +1447,48 @@ impl Ed {
             }
             let text = SharedString::from(st.buffer.text());
             st.reported = Some((version, text.clone()));
-            text
+            (text, st.buffer.rope().clone())
         };
         self.cx.emit(EditorEvent::Change(text));
+        self.cx
+            .emit(EditorEvent::BlobChange(super::EditorTextBlob(rope)));
+        // With the edit's text, so the app never holds a new text it
+        // takes for the saved one.
+        self.report_modified_now(false);
+    }
+
+    /// Tells the app whether the text is other than the saved one, when
+    /// that changed or `always` (`onModifiedChange`), once the turn's other
+    /// work is done (the props of one update, a new text and saved text
+    /// together, are told as one); nothing without a saved text.
+    fn report_modified(&self, always: bool) {
+        let scheduled = self.modified_report.get();
+        self.modified_report
+            .set(Some(always || scheduled.unwrap_or(false)));
+        if scheduled.is_some() {
+            return;
+        }
+        let ed = self.clone();
+        spawn(async move {
+            let always = ed.modified_report.take().unwrap_or(false);
+            ed.report_modified_now(always);
+        });
+    }
+
+    /// [`Self::report_modified`] at once.
+    fn report_modified_now(&self, always: bool) {
+        let modified = {
+            let mut st = self.st.borrow_mut();
+            let Some(modified) = st.saved.as_ref().map(|saved| !st.buffer.is_text(saved)) else {
+                return;
+            };
+            if modified == st.modified && !always {
+                return;
+            }
+            st.modified = modified;
+            modified
+        };
+        self.cx.emit(EditorEvent::ModifiedChange(modified));
     }
 
     pub(crate) fn report_selections(&self) {

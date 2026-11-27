@@ -1386,13 +1386,31 @@ pub(crate) const JSON_ENTRIES: usize = 1 << 20;
 /// nested deeper than [`JSON_DEPTH`] or larger than [`JSON_ENTRIES`] throw.
 pub(crate) fn to_json<'js>(value: &Value<'js>) -> rquickjs::Result<nsh_core::JsonValue> {
     let mut entries = 0;
-    json(value, 0, &mut entries)
+    json(value, 0, &mut entries, false)
+}
+
+/// [`to_json`] of what `host.call` and `host.post` send: a `Blob` (or a
+/// `File`) in it goes as its text (UTF-8, lossily), its bytes read in Rust,
+/// so a large text the app holds as a blob (an editor's `valueBlob()`)
+/// reaches the embedding app without going through the heap.
+pub(crate) fn to_json_with_blobs<'js>(value: &Value<'js>) -> rquickjs::Result<nsh_core::JsonValue> {
+    let mut entries = 0;
+    json(value, 0, &mut entries, true)
+}
+
+/// The text of `value` when it is a `Blob` (or a `File`).
+fn blob_text(value: &Value<'_>) -> rquickjs::Result<Option<String>> {
+    let cx = value.ctx().as_raw().as_ptr();
+    crate::web::blob::blob_of(cx, value.as_raw())
+        .map(|blob| blob.map(|blob| String::from_utf8_lossy(blob.bytes()).into_owned()))
+        .map_err(|_| rquickjs::Error::Exception)
 }
 
 fn json<'js>(
     value: &Value<'js>,
     depth: usize,
     entries: &mut usize,
+    blobs: bool,
 ) -> rquickjs::Result<nsh_core::JsonValue> {
     use nsh_core::JsonValue as J;
     let too_big = |cx: &Ctx<'js>| {
@@ -1435,11 +1453,14 @@ fn json<'js>(
             *entries += len;
             let mut out = Vec::with_capacity(len);
             for i in 0..len {
-                out.push(json(&array.get::<Value>(i)?, depth + 1, entries)?);
+                out.push(json(&array.get::<Value>(i)?, depth + 1, entries, blobs)?);
             }
             J::Array(out)
         }
         Type::Object => {
+            if blobs && let Some(text) = blob_text(value)? {
+                return Ok(J::String(text));
+            }
             let object = value.as_object().expect("object");
             let mut out = serde_json::Map::new();
             for entry in object.props::<String, Value>() {
@@ -1454,7 +1475,7 @@ fn json<'js>(
                 ) {
                     continue;
                 }
-                out.insert(key, json(&item, depth + 1, entries)?);
+                out.insert(key, json(&item, depth + 1, entries, blobs)?);
             }
             J::Object(out)
         }

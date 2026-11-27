@@ -213,6 +213,11 @@ pub(crate) struct State {
     /// the buffer's version then: an unchanged version is an unchanged
     /// text, with no need to make or compare the whole text.
     pub(crate) reported: Option<(u64, nsh_core::element::SharedString)>,
+    /// The text as last saved (`savedValueUrl`), line breaks as the
+    /// buffer's: what `onModifiedChange` compares the text with.
+    pub(crate) saved: Option<ropey::Rope>,
+    /// Whether the text was other than `saved` when last reported.
+    pub(crate) modified: bool,
     /// The selections last reported (`onSelectionChange`).
     pub(crate) reported_selections: Vec<EditorSelection>,
     /// What a search in the selection searches, carried through edits
@@ -264,6 +269,8 @@ impl State {
             reported_folds: Vec::new(),
             composition: None,
             reported: None,
+            saved: None,
+            modified: false,
             reported_selections: Vec::new(),
             search_scope: None,
         }

@@ -931,6 +931,89 @@ fn a_diff_view_reads_its_patch_from_a_blob() {
     );
 }
 
+const EDITOR_BLOB: &str = r##"import { mount, signal, Text, View } from "nsh";
+import { Editor, type EditorRef, TextView } from "nsh/base";
+
+const first = URL.createObjectURL(new Blob(["one\r\ntwo\n"]));
+const opened = signal(first);
+const saved = signal(first);
+const reports: boolean[] = [];
+const blobs: Blob[] = [];
+const shown = signal("waiting");
+const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+let editor!: EditorRef;
+setTimeout(async () => {
+  await tick();
+  await editor.insert("x");
+  await tick();
+  const blob = blobs[blobs.length - 1];
+  const text = await blob.text();
+  await editor.run("undo");
+  await tick();
+  // Saved elsewhere: the text it holds now is not the saved one.
+  saved.set(URL.createObjectURL(blob));
+  await tick();
+  // Read again from disk: the text and the saved text change together,
+  // told once, never modified on the way.
+  const reread = URL.createObjectURL(new Blob(["fresh"]));
+  opened.set(reread);
+  saved.set(reread);
+  await tick();
+  const now = await editor.value();
+  shown.set(
+    `got ${blobs.length} ${blob instanceof Blob} ${blob.type} ${JSON.stringify(text)} ${now} ${reports.join(",")}`,
+  );
+}, 0);
+
+const doc = URL.createObjectURL(new Blob(["# From a blob"]));
+mount(() => (
+  <View>
+    <Editor
+      ref={editor}
+      valueUrl={opened()}
+      savedValueUrl={saved()}
+      onModifiedChange={({ modified }) => reports.push(modified)}
+      onBlobChange={({ blob }) => blobs.push(blob)}
+      style={{ height: 200 }}
+    />
+    <TextView markdownUrl={doc} />
+    <Text>{shown()}</Text>
+  </View>
+));
+"##;
+
+/// An editor takes its text and the saved one by `blob:` URLs, tells when
+/// its text is not the saved one (undoing back is unmodified again, a new
+/// saved text is told at once, a new text and saved text together are told
+/// once), and gives its text as a `Blob` at each edit (an undo is one, a
+/// text the app gives none); a text view shows Markdown from a blob.
+#[test]
+fn an_editor_and_a_text_view_take_texts_from_blobs() {
+    let (_engine, rx) = start(EDITOR_BLOB);
+    let (mut got, mut heading) = (None, false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (got.is_none() || !heading) && std::time::Instant::now() < deadline {
+        let Ok(batch) = rx.recv_timeout(Duration::from_millis(100)) else {
+            continue;
+        };
+        for item in batch.items {
+            if let MountItem::Text { text, .. } = item {
+                if text.text.starts_with("got") {
+                    got = Some(text.text.clone());
+                }
+                heading |= text.text == "From a blob";
+            }
+        }
+    }
+    assert!(heading, "the text view shows the blob's Markdown");
+    assert_eq!(
+        got.as_deref(),
+        Some(
+            "got 2 true text/plain;charset=utf-8 \"xone\\ntwo\\n\" fresh false,true,false,true,false"
+        )
+    );
+}
+
 const METHODS: &str = r#"import { mount, signal, Text, View } from "nsh";
 import { Stepper, type StepperRef } from "test/ui";
 

@@ -21,6 +21,7 @@ mod alert_dialog;
 #[cfg(any(feature = "editor", feature = "rich-editor"))]
 mod autoscroll;
 mod avatar;
+mod blob_text;
 mod button;
 mod calendar;
 mod carousel;
@@ -112,6 +113,7 @@ use nsh_core::element::{ComponentSpec, Registry};
 /// TSX's `Input` of `nsh/base`, a host element the core makes.
 pub use nsh_core::element::{Input, input};
 
+pub use crate::blob_text::BlobText;
 #[cfg(feature = "emoji-picker")]
 pub use crate::emoji_picker::{
     EmojiAnnotation, EmojiEntry, EmojiGroup, EmojiGroupId, EmojiGroupLabels, EmojiPicker,
@@ -279,8 +281,8 @@ pub use crate::{
 #[cfg(feature = "editor")]
 pub use crate::{
     diff::{
-        BlobText, DiffAnnotation, DiffChange, DiffExpand, DiffFile, DiffFileLine, DiffFileStatus,
-        DiffHunk, DiffHunkBounds, DiffIndicators, DiffInline, DiffLayout, DiffLine, DiffLineRange,
+        DiffAnnotation, DiffChange, DiffExpand, DiffFile, DiffFileLine, DiffFileStatus, DiffHunk,
+        DiffHunkBounds, DiffIndicators, DiffInline, DiffLayout, DiffLine, DiffLineRange,
         DiffSeparator, DiffSide, DiffStats, DiffView, DiffViewApi, DiffViewClasses,
         DiffViewElement, DiffViewEvent, DiffViewPart, DiffViewProps, DiffViewStyles, diff_view,
     },

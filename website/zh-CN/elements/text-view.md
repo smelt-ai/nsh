@@ -751,7 +751,8 @@ fn chat() -> impl IntoElement {
 | 属性 | Rust | 类型 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `markdown` | `.markdown(..)` | `string` | | Markdown 形式的文档。 |
-| `html` | `.html(..)` | `string` | | HTML 形式的文档，未提供 `markdown` 时使用。 |
+| `markdownUrl` | `.markdown_url(..)` | `string` | | blob 里的 Markdown 文档，用它的 `blob:` 地址传入，未提供 `markdown` 时使用：从 blob 的字节读取，不经过应用的堆。 |
+| `html` | `.html(..)` | `string` | | HTML 形式的文档，未提供 Markdown 时使用。 |
 | `document` | `.document(..)` | `TextViewDocument` | | 文档块形式的文档，`markdown` 和 `html` 都未提供时使用。 |
 | `options` | `.options(..)` | `MarkdownOptions` | 全部默认值 | 读取的 Markdown 语法（[选项](#options)）。 |
 | `extensions` | `.extensions(..)` | `MarkdownExtension[]` | `[]` | 应用自己的语法，生成自定义节点（[Markdown 扩展](#markdown-extensions)）。 |

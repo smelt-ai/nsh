@@ -14,10 +14,9 @@ mod patch;
 mod review;
 mod view;
 
-use nsh_core::{
-    element::{JsHost, JsIn, JsOwned, JsValue, PropError, TsTypes},
-    prelude::*,
-};
+use nsh_core::prelude::*;
+
+use crate::blob_text::BlobText;
 pub use parts::{DiffViewClasses, DiffViewPart, DiffViewStyles};
 
 use self::controller::Dv;
@@ -208,52 +207,6 @@ pub struct DiffFileLine {
     pub path: SharedString,
     /// Its number in the file, from 1: the one it shows.
     pub number: u32,
-}
-
-/// A text a prop takes by a `blob:` URL (`URL.createObjectURL`): the
-/// blob's bytes, as UTF-8, read when the prop is set, so a large text
-/// goes to the view without going through the app's heap (`patchUrl`). A
-/// URL no blob has (revoked, never made) is an empty text.
-#[derive(Debug, Clone, Default)]
-pub struct BlobText {
-    /// The URL.
-    pub url: SharedString,
-    /// The blob's text.
-    pub text: SharedString,
-}
-
-impl PartialEq for BlobText {
-    /// A blob's bytes never change: the same URL is the same text.
-    fn eq(&self, other: &Self) -> bool {
-        self.url == other.url
-    }
-}
-
-impl JsValue for BlobText {
-    fn ts_type(_types: &mut TsTypes) -> String {
-        "string".into()
-    }
-
-    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
-        let url = value
-            .as_string()
-            .ok_or_else(|| value.expected("a blob: URL"))?;
-        let text = match value.host().blob(&url) {
-            Some((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
-            None => {
-                log::warn!("DiffView: no blob has the URL {url}");
-                String::new()
-            }
-        };
-        Ok(BlobText {
-            url: url.into(),
-            text: text.into(),
-        })
-    }
-
-    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
-        self.url.to_js(host)
-    }
 }
 
 /// How a file of a [`DiffView`]'s patch changed, in git's terms.

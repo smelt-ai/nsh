@@ -839,7 +839,8 @@ has each text parsed in one go.
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
 | `markdown` | `.markdown(..)` | `string` | | The document as Markdown. |
-| `html` | `.html(..)` | `string` | | The document as HTML, when `markdown` is not given. |
+| `markdownUrl` | `.markdown_url(..)` | `string` | | The document as Markdown in a blob, by its `blob:` URL, when `markdown` is not given: read from the blob's bytes, not the app's heap. |
+| `html` | `.html(..)` | `string` | | The document as HTML, when no Markdown is given. |
 | `document` | `.document(..)` | `TextViewDocument` | | The document as blocks, when neither `markdown` nor `html` is given. |
 | `options` | `.options(..)` | `MarkdownOptions` | all defaults | The Markdown syntax read ([Options](#options)). |
 | `extensions` | `.extensions(..)` | `MarkdownExtension[]` | `[]` | The app's syntax, as custom nodes ([Markdown extensions](#markdown-extensions)). |
