@@ -2279,6 +2279,9 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
     match vk {
         // The input method takes the keys it composes with.
         _ if input.composing() => false,
+        _ if mac && m.ctrl && !m.meta && !m.alt && (0x41..=0x5A).contains(&vk) => {
+            emacs(surface, &view, &input, event)
+        }
         // Alt+Left goes back, from a field too (`navigation::key_pressed`),
         // except on macOS where Option moves by words.
         _ if (vk == VK_LEFT || vk == VK_RIGHT) && !edge && (!m.alt || mac) => {
@@ -2407,6 +2410,83 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// Control+letter on macOS: Cocoa's Emacs keys, as AppKit's text views and
+/// nsh's editor take them. A and E go to the paragraph's start and end, B,
+/// F, P and N are Left, Right, Up and Down (Shift selecting), H and D are
+/// Backspace and Delete, K deletes to the paragraph's end, T swaps the
+/// characters around the caret. The other letters stay the app's.
+fn emacs(surface: &Rc<Surface>, view: &NshView, input: &InputState, event: &KeyEvent) -> bool {
+    let shift = event.modifiers.shift;
+    let as_key = |vk, shift, meta| {
+        let mut event = *event;
+        event.vk = vk;
+        event.modifiers = Modifiers {
+            shift,
+            meta,
+            ..Modifiers::default()
+        };
+        key(surface, &event)
+    };
+    match event.vk {
+        0x41 | 0x45 => {
+            let to = {
+                let model = input.model.borrow();
+                let (text, caret) = (model.text(), model.caret());
+                if event.vk == 0x41 {
+                    text[..caret].rfind('\n').map_or(0, |i| i + 1)
+                } else {
+                    text[caret..].find('\n').map_or(text.len(), |i| caret + i)
+                }
+            };
+            input.goal_x.set(None);
+            input.model.borrow_mut().move_to(to, shift);
+            after_edit(surface, view, input, false);
+            true
+        }
+        0x42 => as_key(VK_LEFT, shift, false),
+        0x46 => as_key(VK_RIGHT, shift, false),
+        0x50 => as_key(VK_UP, shift, false),
+        0x4E => as_key(VK_DOWN, shift, false),
+        0x48 => as_key(VK_BACK, false, false),
+        0x44 => as_key(VK_DELETE, false, false),
+        // Command+Delete: to the paragraph's end, or the line break there.
+        0x4B => as_key(VK_DELETE, false, true),
+        0x54 => transpose(surface, view, input),
+        _ => false,
+    }
+}
+
+/// Control+T: swaps the characters before and after the caret (the two
+/// before it at a paragraph's end) and moves past them, as AppKit's
+/// `transpose:`.
+fn transpose(surface: &Rc<Surface>, view: &NshView, input: &InputState) -> bool {
+    if !input.config.borrow().editable {
+        return true;
+    }
+    let edited = {
+        let mut model = input.model.borrow_mut();
+        let (text, caret) = (model.text(), model.caret());
+        let at_end = text[caret..].chars().next().is_none_or(|c| c == '\n');
+        let mid = if at_end {
+            model::prev_cluster(text, caret)
+        } else {
+            caret
+        };
+        let start = model::prev_cluster(text, mid);
+        let end = model::next_cluster(text, mid);
+        if model.has_selection() || start == mid || mid == end {
+            false
+        } else {
+            let swapped = format!("{}{}", &text[mid..end], &text[start..mid]);
+            model.select(start, end);
+            model.insert(&swapped, None).is_some()
+        }
+    };
+    input.goal_x.set(None);
+    after_edit(surface, view, input, edited);
+    true
 }
 
 /// Copies the selection (never a password's).
@@ -3002,5 +3082,74 @@ mod tests {
         // the text.
         assert_eq!(m.text_at(2, false), 1);
         assert_eq!(m.text_at(4, false), 2);
+    }
+
+    /// Control+`letter` (Shift too) on the focused field; true when handled.
+    #[cfg(target_os = "macos")]
+    fn control(surface: &Rc<Surface>, letter: u8, shift: bool) -> bool {
+        let modifiers = Modifiers {
+            ctrl: true,
+            shift,
+            ..Modifiers::default()
+        };
+        key(
+            surface,
+            &KeyEvent {
+                vk: u16::from(letter.to_ascii_uppercase()),
+                down: true,
+                repeat: false,
+                modifiers,
+            },
+        )
+    }
+
+    /// Cocoa's Emacs keys edit a field as they do AppKit's text views:
+    /// paragraph edges, character moves, deletions and transposition.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emacs_keys() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        let field = NshView::new(4, nsh_core::ViewKind::Input);
+        field.insert_before(&surface.root, None);
+        focus_for_test(&surface, &field);
+        let input = input_of(&field).unwrap();
+        input.model.borrow_mut().set_text("ab\ncd");
+        input.model.borrow_mut().move_to(4, false);
+        let state = || {
+            let m = input.model.borrow();
+            (m.text().to_owned(), m.selection())
+        };
+        let text = |s: &str, start, end| (s.to_owned(), (start, end));
+        // A and E: the paragraph's start and end, Shift selecting.
+        assert!(control(&surface, b'a', false));
+        assert_eq!(state(), text("ab\ncd", 3, 3));
+        assert!(control(&surface, b'e', true));
+        assert_eq!(state(), text("ab\ncd", 3, 5));
+        // B and F: a character back and forward.
+        assert!(control(&surface, b'b', false));
+        assert_eq!(state(), text("ab\ncd", 3, 3));
+        assert!(control(&surface, b'f', false));
+        assert_eq!(state(), text("ab\ncd", 4, 4));
+        // K: to the paragraph's end, then its line break.
+        input.model.borrow_mut().move_to(1, false);
+        assert!(control(&surface, b'k', false));
+        assert_eq!(state(), text("a\ncd", 1, 1));
+        assert!(control(&surface, b'k', false));
+        assert_eq!(state(), text("acd", 1, 1));
+        // T: the characters around the caret, the two before it at the end.
+        assert!(control(&surface, b't', false));
+        assert_eq!(state(), text("cad", 2, 2));
+        input.model.borrow_mut().move_to(3, false);
+        assert!(control(&surface, b't', false));
+        assert_eq!(state(), text("cda", 3, 3));
+        // H and D: Backspace and Delete.
+        assert!(control(&surface, b'h', false));
+        assert_eq!(state(), text("cd", 2, 2));
+        input.model.borrow_mut().move_to(0, false);
+        assert!(control(&surface, b'd', false));
+        assert_eq!(state(), text("d", 0, 0));
+        // Other Control keys stay the app's.
+        assert!(!control(&surface, b'j', false));
+        surface_stopped(surface.key());
     }
 }
