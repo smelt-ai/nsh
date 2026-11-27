@@ -339,6 +339,16 @@ pub trait JsHost {
         None
     }
 
+    /// The bytes and type of the blob `blob:` URL `url` names in this VM
+    /// (`URL.createObjectURL`), shared, not copied: what a Rust component's
+    /// prop that takes a text or file by URL reads, so the bytes never go
+    /// through the app's heap. `None` for a URL no blob has (revoked, never
+    /// made) or a host without blobs.
+    fn blob(&self, url: &str) -> Option<(crate::ImageData, String)> {
+        let _ = url;
+        None
+    }
+
     /// Runs `f` when what owns the call in JS goes (`CallCx::on_cleanup`);
     /// a host without owners keeps it until it goes itself. Returns what
     /// unregisters `f` without running it.

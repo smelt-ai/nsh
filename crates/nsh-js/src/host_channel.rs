@@ -35,7 +35,9 @@ use std::{
 use nsh_core::{
     JsonValue,
     element::{IntoThrown, JsError},
-    host_channel::{HostBridge, HostInbox, MAX_PENDING_CALLS, ModuleFake, check_name},
+    host_channel::{
+        HostAnswer, HostBlob, HostBridge, HostInbox, MAX_PENDING_CALLS, ModuleFake, check_name,
+    },
 };
 use rquickjs::qjs;
 use rustc_hash::FxHashMap;
@@ -119,6 +121,48 @@ fn to_json(cx: Ctx, v: Raw) -> R<JsonValue> {
 /// JSON as a JS value.
 fn from_json(cx: Ctx, json: &JsonValue) -> V {
     V::own(cx, crate::host::json_to_js(cx, json))
+}
+
+/// Puts `blob` at its place in `value`, the answer to call `name`, as a
+/// `Blob` sharing its bytes. One whose place's parent is not there is
+/// left out (logged): the embedding app's mistake, not the app's.
+fn place_blob(cx: Ctx, value: &V, name: &str, blob: HostBlob) {
+    let HostBlob { at, bytes, mime } = blob;
+    let placed = (|| -> R<bool> {
+        let Some(tokens) = nsh_core::host_channel::pointer_tokens(&at) else {
+            return Ok(false);
+        };
+        let Some((last, parents)) = tokens.split_last() else {
+            return Ok(false);
+        };
+        let mut parent = value.clone_ref();
+        for token in parents {
+            if !js::is_object(parent.raw()) {
+                return Ok(false);
+            }
+            parent = js::get(cx, parent.raw(), token)?;
+        }
+        if !js::is_object(parent.raw()) {
+            return Ok(false);
+        }
+        let made = crate::web::blob::new_blob(cx, crate::web::blob::Blob::shared(bytes, mime))?;
+        js::define(cx, parent.raw(), last, made, true)?;
+        Ok(true)
+    })();
+    match placed {
+        Ok(true) => {}
+        Ok(false) => log::warn!(
+            target: "js",
+            "nsh/host: the embedding app's answer to \"{name}\" has no place {at:?} for a blob; it was left out"
+        ),
+        Err(Throw) => {
+            let _ = js::take_exception(cx);
+            log::warn!(
+                target: "js",
+                "nsh/host: the blob at {at:?} of the embedding app's answer to \"{name}\" could not be made; it was left out"
+            );
+        }
+    }
 }
 
 /// The JS error of `error`: its class, message and `code` / ... fields.
@@ -480,7 +524,7 @@ pub(crate) fn deliver(cx: Ctx, name: &str, data: JsonValue) {
 
 /// Settles call `id` with the embedding app's answer, or its error
 /// message (`ERR_NSH_HOST_ERROR`).
-pub(crate) fn settle(cx: Ctx, id: u64, result: Result<JsonValue, String>) {
+pub(crate) fn settle(cx: Ctx, id: u64, result: Result<HostAnswer, String>) {
     finish(
         cx,
         id,
@@ -489,14 +533,15 @@ pub(crate) fn settle(cx: Ctx, id: u64, result: Result<JsonValue, String>) {
 }
 
 /// Settles call `id` with `result`.
-fn finish(cx: Ctx, id: u64, result: Result<JsonValue, JsError>) {
+fn finish(cx: Ctx, id: u64, result: Result<HostAnswer, JsError>) {
     let Some(call) = channel(cx).calls.borrow_mut().remove(&id) else {
         return;
     };
     let deferred = call.deferred;
     match result {
-        Ok(value) => {
-            if let Some(ceiling) = too_large(cx, &value) {
+        Ok(answer) => {
+            // The blobs' bytes stay native: only the value counts.
+            if let Some(ceiling) = too_large(cx, &answer.value) {
                 let e = error(
                     cx,
                     nsh_core::host_channel::answer_too_large(&call.name, ceiling),
@@ -504,7 +549,10 @@ fn finish(cx: Ctx, id: u64, result: Result<JsonValue, JsError>) {
                 deferred.reject(cx, e.raw());
                 return;
             }
-            let value = from_json(cx, &value);
+            let value = from_json(cx, &answer.value);
+            for blob in answer.blobs {
+                place_blob(cx, &value, &call.name, blob);
+            }
             deferred.resolve(cx, value.raw());
         }
         Err(e) => {
@@ -550,14 +598,19 @@ export interface Host {
   /** Calls the embedding app's handler of `name` with `data`: the promise
    * resolves with its answer, or rejects with an `Error` with the message the
    * handler gave and `code` `"ERR_NSH_HOST_ERROR"`, also at once when the
-   * embedding app handles no `name`. It rejects with `code`
+   * embedding app handles no `name`. The answer is JSON, where the handler
+   * may put `Blob`s: large texts and files whose bytes stay out of the app's
+   * heap (hand one on as `URL.createObjectURL(blob)`; the web player gives
+   * their text instead). It rejects with `code`
    * `"ERR_ACCESS_DENIED"` (`permission` `"host"`, `resource` the name) when
    * `capabilities.host` does not grant `name`, `"ETIMEDOUT"` once
    * `options.timeout` milliseconds passed (30000 unless set; 0 waits as long
    * as the host takes), `"ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"` on a platform
    * without a host, and `"ERR_NSH_QUOTA_EXCEEDED"` while 1024 calls wait
-   * for answers already; with a `TypeError` for a wrong name and a
-   * `RangeError` for a negative timeout. It never throws. */
+   * for answers already, or when the answer's JSON is more than one answer
+   * may bring into the app (an eighth of its heap limit); with a `TypeError`
+   * for a wrong name and a `RangeError` for a negative timeout. It never
+   * throws. */
   call<T = HostValue>(name: string, data?: unknown, options?: { timeout?: number }): Promise<T>;
   /** Hands `data` to the embedding app's handler of `name`, without an
    * answer; it is dropped when the embedding app handles no `name` or there
@@ -695,10 +748,10 @@ host.post("seen", "home");
         assert_eq!(*bridge.posts.borrow(), [("seen".to_owned(), json!("home"))]);
         assert_eq!(pending_calls(&host), 2);
         host.host_reply(calls[1].0, Err("disk full".into()));
-        host.host_reply(calls[0].0, Ok(json!({ "name": "Ada" })));
+        host.host_reply(calls[0].0, Ok(json!({ "name": "Ada" }).into()));
         // A second answer, or one for no call, is ignored.
-        host.host_reply(calls[0].0, Ok(json!(null)));
-        host.host_reply(999, Ok(json!(null)));
+        host.host_reply(calls[0].0, Ok(json!(null).into()));
+        host.host_reply(999, Ok(json!(null).into()));
         assert_eq!(
             reported(&host),
             ["save ERR_NSH_HOST_ERROR disk full", "profile Ada"]
@@ -742,7 +795,7 @@ Image.getSize("b.png", {{ at: 2 }}).then((s) => report("size " + s.width));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "size");
         assert_eq!(calls[0].2, json!(["b.png", { "at": 2 }]));
-        host.host_reply(calls[0].0, Ok(json!({ "width": 64 })));
+        host.host_reply(calls[0].0, Ok(json!({ "width": 64 }).into()));
         assert_eq!(reported(&host), ["size 64"]);
     }
 
@@ -874,8 +927,8 @@ host.call("wait", null, {{ timeout: 0 }}).then(report);
         assert_eq!(reported(&host), ["ETIMEDOUT"]);
         assert_eq!(pending_calls(&host), 1);
         let calls = bridge.calls.borrow();
-        host.host_reply(calls[0].0, Ok(json!("too late")));
-        host.host_reply(calls[1].0, Ok(json!("answered")));
+        host.host_reply(calls[0].0, Ok(json!("too late").into()));
+        host.host_reply(calls[1].0, Ok(json!("answered").into()));
         assert_eq!(reported(&host), ["answered"]);
         assert!(host.next_timer().is_none());
     }

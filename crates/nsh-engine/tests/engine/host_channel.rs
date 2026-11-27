@@ -233,6 +233,65 @@ fn an_answer_too_large_for_the_app_fails_alone() {
     drop(engine);
 }
 
+const BLOB: &str = r#"import { mount, signal, Text } from "nsh";
+import { host } from "nsh";
+
+const log = signal<string[]>([]);
+const say = (s: string) => log.set([...log(), s]);
+host.call("diff").then(async (v: any) => {
+  const blob = v.diff.text;
+  say(`${v.diff.kind} ${blob instanceof Blob} ${blob.type} ${blob.size}`);
+  say(`starts ${await blob.slice(0, 4).text()}`);
+  say(`url ${URL.createObjectURL(blob).startsWith("blob:")}`);
+  say(`rows ${v.rows[1] instanceof Blob} ${await v.rows[1].text()}`);
+});
+
+mount(() => <Text>{log().join(" | ")}</Text>);
+"#;
+
+/// An answer's blobs reach the app as `Blob`s whose bytes stay native: one
+/// past what the heap may take as JSON is answered, and reads as sent.
+#[test]
+fn an_answer_carries_blobs_outside_the_heap() {
+    use nsh_core::host_channel::{HostAnswer, HostBlob};
+    let host = HostChannel::new();
+    host.handle("diff", |call| {
+        let text = format!("@@ {}", "x".repeat(3 << 20));
+        call.answer(HostAnswer {
+            value: json!({ "diff": { "kind": "text", "text": null }, "rows": [0, null] }),
+            blobs: vec![
+                HostBlob {
+                    at: "/diff/text".into(),
+                    bytes: nsh_core::ImageData::new(text.into_bytes()),
+                    mime: "text/x-diff".into(),
+                },
+                HostBlob {
+                    at: "/rows/1".into(),
+                    bytes: nsh_core::ImageData::new(b"one".to_vec()),
+                    mime: "text/plain".into(),
+                },
+            ],
+        })
+    });
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let config = EngineConfig {
+        viewport: Size::new(px(400.0), px(600.0)),
+        host: host.clone(),
+        limits: nsh_engine::Limits {
+            memory_bytes: 16 << 20,
+            ..nsh_engine::Limits::default()
+        },
+        ..EngineConfig::new(bundle(BLOB))
+    };
+    let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
+    let first = format!("text true text/x-diff {}", 3 + (3 << 20));
+    wait_for(
+        &rx,
+        &[first.as_str(), "starts @@ x", "url true", "rows true one"],
+    );
+    drop(engine);
+}
+
 const LISTENER: &str = r#"import { mount, signal, Text } from "nsh";
 import { host } from "nsh";
 

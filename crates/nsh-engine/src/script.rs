@@ -311,7 +311,11 @@ mod imp {
             self.host.host_event(name, data);
         }
 
-        pub(crate) fn host_reply(&self, id: u64, result: Result<nsh_core::JsonValue, String>) {
+        pub(crate) fn host_reply(
+            &self,
+            id: u64,
+            result: Result<nsh_core::host_channel::HostAnswer, String>,
+        ) {
             self.host.host_reply(id, result);
         }
 
@@ -498,7 +502,11 @@ mod stub {
             match *self {}
         }
 
-        pub(crate) fn host_reply(&self, _: u64, _: Result<nsh_core::JsonValue, String>) {
+        pub(crate) fn host_reply(
+            &self,
+            _: u64,
+            _: Result<nsh_core::host_channel::HostAnswer, String>,
+        ) {
             match *self {}
         }
 

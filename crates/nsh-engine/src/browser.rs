@@ -112,7 +112,7 @@ pub trait Host {
     /// Deliver an embedding host event.
     fn host_event(&self, name: &str, data: nsh_core::JsonValue);
     /// Complete an embedding host call.
-    fn host_reply(&self, id: u64, result: Result<nsh_core::JsonValue, String>);
+    fn host_reply(&self, id: u64, result: Result<nsh_core::host_channel::HostAnswer, String>);
     /// When the earliest timer the host keeps on the engine's clock is
     /// due. A host whose timers run in the browser's event loop keeps none.
     fn next_timer(&self) -> Option<Instant> {
@@ -286,7 +286,11 @@ impl Script {
     pub(crate) fn host_event(&self, name: &str, data: nsh_core::JsonValue) {
         self.0.host_event(name, data);
     }
-    pub(crate) fn host_reply(&self, id: u64, result: Result<nsh_core::JsonValue, String>) {
+    pub(crate) fn host_reply(
+        &self,
+        id: u64,
+        result: Result<nsh_core::host_channel::HostAnswer, String>,
+    ) {
         self.0.host_reply(id, result);
     }
     pub(crate) fn animations_finished(&self, finished: &[nsh_core::animation::Finished]) {

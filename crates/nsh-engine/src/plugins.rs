@@ -397,7 +397,7 @@ impl Plugins {
         &mut self,
         tenant: TenantId,
         id: u64,
-        result: Result<nsh_core::JsonValue, String>,
+        result: Result<nsh_core::host_channel::HostAnswer, String>,
     ) {
         if let Some(vm) = self.vms.get_mut(&tenant) {
             vm.run_charged(|s| s.host_reply(id, result));

@@ -1671,11 +1671,11 @@ enum Message {
     /// data.
     HostEvent(String, nsh_core::JsonValue),
     /// The embedding app's answer to call `.0` (`host.call`).
-    HostReply(u64, Result<nsh_core::JsonValue, String>),
+    HostReply(u64, Result<nsh_core::host_channel::HostAnswer, String>),
     /// The embedding app's answer to call `.0` the core made
     /// ([`nsh_core::element::host_call`], and JS's calls without a
     /// channel of their own).
-    CoreHostReply(u64, Result<nsh_core::JsonValue, String>),
+    CoreHostReply(u64, Result<nsh_core::host_channel::HostAnswer, String>),
     /// Loads (or reloads) a sandboxed guest plugin VM on this engine thread.
     LoadPlugin(PluginConfig),
     /// Unloads a guest plugin VM by id and tears down its entire tenant subtree.
@@ -1683,7 +1683,11 @@ enum Message {
     /// Event delivered to a guest plugin VM's `HostChannel`.
     PluginHostEvent(TenantId, String, nsh_core::JsonValue),
     /// Answer delivered to a guest plugin VM's `HostChannel` call.
-    PluginHostReply(TenantId, u64, Result<nsh_core::JsonValue, String>),
+    PluginHostReply(
+        TenantId,
+        u64,
+        Result<nsh_core::host_channel::HostAnswer, String>,
+    ),
     /// Queries live node count, active plugin count and total loop wakeups.
     SnapshotStats(Box<dyn FnOnce(EngineStats) + Send>),
     /// The embedding app's URL handler answered URL request `id`: it took
@@ -5023,7 +5027,9 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
         }
         Message::CoreHostReply(id, result) => state.core.answer_host(
             id,
-            result.map_err(nsh_core::host_channel::HostError::Failed),
+            result
+                .map(nsh_core::host_channel::HostAnswer::into_json)
+                .map_err(nsh_core::host_channel::HostError::Failed),
         ),
         Message::PluginHostEvent(tenant, name, data) => {
             state.plugins.host_event(tenant, &name, data);

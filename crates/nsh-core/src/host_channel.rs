@@ -149,6 +149,89 @@ pub fn json_size(value: &JsonValue, ceiling: usize) -> usize {
     total
 }
 
+/// Bytes of an embedding app's answer that the app gets as a `Blob` at `at`,
+/// a place in the answer's value (a JSON pointer, RFC 6901: `/diff/text`):
+/// they stay out of the app's heap, as a fetched body's `blob()` does, so an
+/// answer may carry a large text or file the app hands on (a `blob:` URL of
+/// it to a component) without reading it.
+#[derive(Debug, Clone)]
+pub struct HostBlob {
+    /// Where it goes in the answer's value. Its parent (an object, or an
+    /// array for a last token that is an index) must be there; what is at
+    /// the place itself is replaced.
+    pub at: String,
+    /// Its bytes, shared.
+    pub bytes: crate::ImageData,
+    /// Its type (`Blob.type`), as `text/plain;charset=utf-8`.
+    pub mime: String,
+}
+
+/// An answer of the embedding app to a call: a JSON value, and the blobs
+/// that go at places of it ([`HostBlob`]).
+#[derive(Debug, Clone, Default)]
+pub struct HostAnswer {
+    /// The value.
+    pub value: JsonValue,
+    /// The blobs, put in the value in order.
+    pub blobs: Vec<HostBlob>,
+}
+
+impl From<JsonValue> for HostAnswer {
+    fn from(value: JsonValue) -> Self {
+        HostAnswer {
+            value,
+            blobs: Vec::new(),
+        }
+    }
+}
+
+impl HostAnswer {
+    /// The value with each blob at its place as its text (UTF-8, lossily):
+    /// what a caller with no blobs gets (the app's Rust, the web player).
+    pub fn into_json(self) -> JsonValue {
+        let HostAnswer { mut value, blobs } = self;
+        for blob in blobs {
+            let text = String::from_utf8_lossy(&blob.bytes).into_owned();
+            if let Some(place) = pointer_place(&mut value, &blob.at) {
+                *place = JsonValue::String(text);
+            }
+        }
+        value
+    }
+}
+
+/// The tokens of JSON pointer `at` (RFC 6901: `/a/b~1c` → `a`, `b/c`);
+/// `None` for one that does not start with `/` (the empty pointer, the whole
+/// value, is no place for a blob).
+pub fn pointer_tokens(at: &str) -> Option<Vec<String>> {
+    let rest = at.strip_prefix('/')?;
+    Some(
+        rest.split('/')
+            .map(|token| token.replace("~1", "/").replace("~0", "~"))
+            .collect(),
+    )
+}
+
+/// The place JSON pointer `at` names in `value`, made when its parent is an
+/// object without it.
+fn pointer_place<'a>(value: &'a mut JsonValue, at: &str) -> Option<&'a mut JsonValue> {
+    let tokens = pointer_tokens(at)?;
+    let (last, parents) = tokens.split_last()?;
+    let mut parent = value;
+    for token in parents {
+        parent = match parent {
+            JsonValue::Object(map) => map.get_mut(token)?,
+            JsonValue::Array(items) => items.get_mut(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    match parent {
+        JsonValue::Object(map) => Some(map.entry(last.clone()).or_insert(JsonValue::Null)),
+        JsonValue::Array(items) => items.get_mut(last.parse::<usize>().ok()?),
+        _ => None,
+    }
+}
+
 /// How long a call waits for the host's answer unless its options say
 /// ([`HostCallOptions`]; TS: `host.call`'s `timeout`).
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -434,6 +517,33 @@ mod tests {
         assert!(check_name("").is_err());
         assert!(check_name(&"x".repeat(MAX_NAME_LEN)).is_ok());
         assert!(check_name(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn blobs_reach_a_caller_without_blobs_as_their_text() {
+        let blob = |at: &str, text: &str| HostBlob {
+            at: at.into(),
+            bytes: crate::ImageData::new(text.as_bytes().to_vec()),
+            mime: "text/plain".into(),
+        };
+        let answer = HostAnswer {
+            value: json!({ "diff": { "kind": "text", "text": null }, "list": [0, 1] }),
+            blobs: vec![
+                blob("/diff/text", "@@ -1 +1 @@"),
+                blob("/list/1", "one"),
+                blob("/a~1b", "slash"),
+                blob("/missing/x", "nowhere"),
+                blob("", "the whole value"),
+            ],
+        };
+        assert_eq!(
+            answer.into_json(),
+            json!({
+                "diff": { "kind": "text", "text": "@@ -1 +1 @@" },
+                "list": [0, "one"],
+                "a/b": "slash",
+            })
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crossbeam_channel::{Receiver, Sender};
 use nsh_core::host_channel::HostBridge;
 use nsh_core::{
     JsonValue, SHELL_TENANT, TenantId,
-    host_channel::{HostError, HostInbox, HostRequest, ModuleFake, check_name},
+    host_channel::{HostAnswer, HostError, HostInbox, HostRequest, ModuleFake, check_name},
 };
 
 use crate::Message;
@@ -655,6 +655,15 @@ impl HostCall {
         }
     }
 
+    /// Answers the call with `answer`: its value, with its blobs at their
+    /// places as `Blob`s whose bytes stay out of the app's heap
+    /// ([`HostBlob`](nsh_core::host_channel::HostBlob)).
+    pub fn answer(mut self, answer: HostAnswer) {
+        if let Some(reply) = self.reply.take() {
+            reply.answer(answer);
+        }
+    }
+
     /// The reply alone, to answer from elsewhere (`None` for a post).
     pub fn into_reply(mut self) -> Option<HostReply> {
         self.reply.take()
@@ -769,12 +778,18 @@ impl HostReply {
 
     /// Answers with `result`. An app that stopped meanwhile drops it.
     pub fn reply(mut self, result: Result<JsonValue, String>) {
-        self.send(result);
+        self.send(result.map(HostAnswer::from));
+        self.answered();
+    }
+
+    /// The app's promise resolves with `answer` ([`HostCall::answer`]).
+    pub fn answer(mut self, answer: HostAnswer) {
+        self.send(Ok(answer));
         self.answered();
     }
 
     /// Puts `result` on the queue of the engine that made the call, once.
-    fn send(&mut self, result: Result<JsonValue, String>) {
+    fn send(&mut self, result: Result<HostAnswer, String>) {
         if let Some(tx) = self.tx.take() {
             let msg = if self.to_core {
                 Message::CoreHostReply(self.id, result)

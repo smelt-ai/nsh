@@ -319,7 +319,9 @@ impl Host for Runtime {
             })(),
         );
     }
-    fn host_reply(&self, id: u64, result: Result<nsh_core::JsonValue, String>) {
+    // The page's JS takes JSON: a blob comes as its text.
+    fn host_reply(&self, id: u64, result: Result<nsh_core::host_channel::HostAnswer, String>) {
+        let result = result.map(nsh_core::host_channel::HostAnswer::into_json);
         let ok = result.is_ok();
         self.event(
             "hostReply",

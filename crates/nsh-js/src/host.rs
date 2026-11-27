@@ -894,7 +894,7 @@ impl Host {
 
     /// Settles call `id` (`host.call`) with the embedding app's answer, or
     /// rejects it with the message.
-    pub fn host_reply(&self, id: u64, result: Result<nsh_core::JsonValue, String>) {
+    pub fn host_reply(&self, id: u64, result: Result<nsh_core::host_channel::HostAnswer, String>) {
         if !self.cx.is_live() {
             return;
         }
