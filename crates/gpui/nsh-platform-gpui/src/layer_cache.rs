@@ -48,6 +48,11 @@ const MAX_UNCLIPPED_OVERSHOOT: f32 = 1024.0;
 /// Maximum side length (points) for an unclipped cached layer.
 const MAX_UNCLIPPED_SIDE: f32 = 2048.0;
 
+/// Content-space quantization step (points) for banding oversized layers along
+/// a scrolling axis so `layer_bounds.origin` moves 1:1 with the content instead
+/// of staying pinned to the viewport edge (which would miss on every scroll frame).
+const OVERSIZED_BAND_STEP: f32 = 512.0;
+
 /// Extra margin (points) around the current clip inside which static sibling
 /// children stay grouped in their cached run to avoid run-membership churn on
 /// small scrolls.
@@ -371,6 +376,26 @@ fn snap_rect_outward(x0: f32, y0: f32, x1: f32, y1: f32) -> Option<(f32, f32, f3
 }
 
 #[inline]
+fn band_axis(v0: f32, vlen: f32, c0: f32, clen: f32) -> Option<(f32, f32)> {
+    let vis0 = v0.max(c0);
+    let vis1 = (v0 + vlen).min(c0 + clen);
+    if vis1 <= vis0 {
+        return None;
+    }
+    if vlen <= clen + MAX_UNCLIPPED_OVERSHOOT && vlen <= MAX_UNCLIPPED_SIDE {
+        return Some((v0, vlen));
+    }
+    let rel0 = (vis0 - v0).max(0.0);
+    let rel1 = (vis1 - v0).min(vlen);
+    let b0 = ((rel0 / OVERSIZED_BAND_STEP).floor() * OVERSIZED_BAND_STEP).max(0.0);
+    let b1 = ((rel1 / OVERSIZED_BAND_STEP).ceil() * OVERSIZED_BAND_STEP).min(vlen);
+    if !b0.is_finite() || !b1.is_finite() || b1 <= b0 {
+        return None;
+    }
+    Some((v0 + b0, b1 - b0))
+}
+
+#[inline]
 fn choose_layer_bounds(
     visual: Bounds<Pixels>,
     outer_clip: Bounds<Pixels>,
@@ -379,25 +404,19 @@ fn choose_layer_bounds(
     if visible.is_empty() {
         return None;
     }
-    let vw = f32::from(visual.size.width);
-    let vh = f32::from(visual.size.height);
-    let cw = f32::from(outer_clip.size.width);
-    let ch = f32::from(outer_clip.size.height);
-    if vw <= cw + MAX_UNCLIPPED_OVERSHOOT
-        && vh <= ch + MAX_UNCLIPPED_OVERSHOOT
-        && vw <= MAX_UNCLIPPED_SIDE
-        && vh <= MAX_UNCLIPPED_SIDE
-    {
-        return Some(visual);
-    }
-    let l = f32::from(visible.left()).floor();
-    let t = f32::from(visible.top()).floor();
-    let r = f32::from(visible.right()).ceil();
-    let b = f32::from(visible.bottom()).ceil();
-    if r <= l || b <= t {
-        return None;
-    }
-    Some(crate::render::bounds(l, t, r - l, b - t))
+    let (x, w) = band_axis(
+        f32::from(visual.left()),
+        f32::from(visual.size.width),
+        f32::from(outer_clip.left()),
+        f32::from(outer_clip.size.width),
+    )?;
+    let (y, h) = band_axis(
+        f32::from(visual.top()),
+        f32::from(visual.size.height),
+        f32::from(outer_clip.top()),
+        f32::from(outer_clip.size.height),
+    )?;
+    Some(crate::render::bounds(x, y, w, h))
 }
 
 #[inline]
@@ -1000,5 +1019,42 @@ mod tests {
         let after = subtree_info(&root);
         assert!(!after.has_uncacheable);
         assert!(after.has_canvas);
+    }
+
+    #[test]
+    fn oversized_layer_bands_stay_content_anchored_across_scroll() {
+        let clip = crate::render::bounds(860.0, 75.0, 120.0, 725.0);
+        // 16,000pt tall code editor scrolling by 20pt steps within one 512pt band.
+        let b1 = choose_layer_bounds(crate::render::bounds(860.0, -500.0, 120.0, 16_000.0), clip)
+            .expect("visible");
+        let b2 = choose_layer_bounds(crate::render::bounds(860.0, -520.0, 120.0, 16_000.0), clip)
+            .expect("visible");
+        let b3 = choose_layer_bounds(crate::render::bounds(860.0, -540.0, 120.0, 16_000.0), clip)
+            .expect("visible");
+
+        // X axis stays unclipped; Y axis stays quantized to [512, 1536] in content space.
+        assert_eq!(f32::from(b1.size.width), 120.0);
+        assert_eq!(f32::from(b1.size.height), 1024.0);
+        assert_eq!(b1.size, b2.size);
+        assert_eq!(b2.size, b3.size);
+
+        // Layer origin translates 1:1 with content, keeping device_offset invariant (cache hit).
+        assert_eq!(f32::from(b1.origin.y) - f32::from(b2.origin.y), 20.0);
+        assert_eq!(f32::from(b2.origin.y) - f32::from(b3.origin.y), 20.0);
+        assert_eq!(
+            device_offset(2.0, -500.0, b1.origin.y),
+            device_offset(2.0, -520.0, b2.origin.y),
+        );
+        assert_eq!(
+            device_offset(2.0, -520.0, b2.origin.y),
+            device_offset(2.0, -540.0, b3.origin.y),
+        );
+
+        // Crossing a 512pt band boundary shifts the band cleanly and still covers the clip.
+        let b_next =
+            choose_layer_bounds(crate::render::bounds(860.0, -1020.0, 120.0, 16_000.0), clip)
+                .expect("visible");
+        assert!(f32::from(b_next.top()) <= f32::from(clip.top()));
+        assert!(f32::from(b_next.bottom()) >= f32::from(clip.bottom()));
     }
 }
