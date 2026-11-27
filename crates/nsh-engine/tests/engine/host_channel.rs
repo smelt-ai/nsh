@@ -179,6 +179,60 @@ fn the_app_and_its_host_talk() {
     drop(engine);
 }
 
+const LARGE: &str = r#"import { mount, signal, Text } from "nsh";
+import { host } from "nsh";
+
+const log = signal<string[]>([]);
+const say = (s: string) => log.set([...log(), s]);
+host.on("huge", () => say("huge event"));
+host.on("small", (d: any) => say(`small event ${d}`));
+host
+  .call("huge")
+  .then(() => say("huge answered"))
+  .catch((e) => {
+    say(`huge ${e.code} ${e.message}`);
+    host.call("small").then((v: any) => say(`small ${v.length}`));
+  });
+
+mount(() => <Text>{log().join(" | ")}</Text>);
+"#;
+
+/// An answer or an event too large for the app's heap fails alone: the app
+/// stays and its next call is answered. Made into JS values it would run
+/// the heap out, which stops the VM and every app in it.
+#[test]
+fn an_answer_too_large_for_the_app_fails_alone() {
+    let host = HostChannel::new();
+    // A 16 MB heap takes at most 2 MB of JSON at once.
+    let huge = "x".repeat(3 << 20);
+    host.send("huge", json!(huge.clone())).unwrap();
+    host.send("small", json!(1)).unwrap();
+    host.handle("huge", move |call| call.resolve(json!({ "text": huge })));
+    host.handle("small", |call| call.resolve(json!("y".repeat(1 << 20))));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let config = EngineConfig {
+        viewport: Size::new(px(400.0), px(600.0)),
+        host: host.clone(),
+        limits: nsh_engine::Limits {
+            memory_bytes: 16 << 20,
+            ..nsh_engine::Limits::default()
+        },
+        ..EngineConfig::new(bundle(LARGE))
+    };
+    let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
+    let text = wait_for(
+        &rx,
+        &[
+            "small event 1",
+            "huge ERR_NSH_QUOTA_EXCEEDED host.call(\"huge\"): the embedding app's answer is over the 2 MB one answer may bring into this app",
+            "small 1048576",
+        ],
+    );
+    assert!(!text.contains("huge event"), "{text}");
+    assert!(!text.contains("huge answered"), "{text}");
+    drop(engine);
+}
+
 const LISTENER: &str = r#"import { mount, signal, Text } from "nsh";
 import { host } from "nsh";
 

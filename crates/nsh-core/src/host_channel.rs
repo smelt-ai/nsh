@@ -99,6 +99,56 @@ pub fn too_many_calls(name: &str) -> JsError {
     .with_code(codes::QUOTA_EXCEEDED)
 }
 
+/// What a call of `name` rejects with when the embedding app's answer is
+/// more JSON than the `ceiling` one answer may bring into the VM
+/// ([`crate::js::Limits::incoming_bytes`]; [`codes::QUOTA_EXCEEDED`]).
+pub fn answer_too_large(name: &str, ceiling: usize) -> JsError {
+    JsError::Error(format!(
+        "host.call(\"{name}\"): the embedding app's answer is over the {} MB one answer may bring into this app",
+        ceiling >> 20
+    ))
+    .with_code(codes::QUOTA_EXCEEDED)
+}
+
+/// About how many bytes `value` takes as JSON text, counted until past
+/// `ceiling` (then a number past it): what an answer or an event brings
+/// into a VM ([`answer_too_large`]).
+pub fn json_size(value: &JsonValue, ceiling: usize) -> usize {
+    fn add(value: &JsonValue, total: &mut usize, ceiling: usize) {
+        if *total > ceiling {
+            return;
+        }
+        match value {
+            JsonValue::Null | JsonValue::Bool(_) => *total += 5,
+            JsonValue::Number(_) => *total += 8,
+            JsonValue::String(s) => *total += s.len() + 2,
+            JsonValue::Array(items) => {
+                *total += 2;
+                for item in items {
+                    add(item, total, ceiling);
+                    *total += 1;
+                    if *total > ceiling {
+                        return;
+                    }
+                }
+            }
+            JsonValue::Object(map) => {
+                *total += 2;
+                for (key, item) in map {
+                    *total += key.len() + 4;
+                    add(item, total, ceiling);
+                    if *total > ceiling {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let mut total = 0;
+    add(value, &mut total, ceiling);
+    total
+}
+
 /// How long a call waits for the host's answer unless its options say
 /// ([`HostCallOptions`]; TS: `host.call`'s `timeout`).
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);

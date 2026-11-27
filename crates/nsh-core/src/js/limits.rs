@@ -32,6 +32,16 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// The most JSON one answer or event of the embedding app may bring
+    /// into the VM (`nsh/host`): an eighth of the heap, `None` without a
+    /// heap limit. Made into JS values it takes a few times as much, so
+    /// one answer past it would run the heap out, which stops the VM and
+    /// every app in it; refused, it fails alone
+    /// ([`crate::host_channel::answer_too_large`]).
+    pub fn incoming_bytes(&self) -> Option<usize> {
+        (self.memory_bytes > 0).then_some(self.memory_bytes / 8)
+    }
+
     /// The limits of an app nsh runs on its own (the hosts and runners of
     /// every platform, a web package, `nsh run` without `--limits`): none
     /// but the interpreter stack's, which turns deep recursion into a

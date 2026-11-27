@@ -447,9 +447,24 @@ fn dispatch(cx: Ctx, name: &str, data: &JsonValue) {
     }
 }
 
+/// The most JSON one answer or event may bring into this VM
+/// (`Limits::incoming_bytes`), when `value` is more.
+fn too_large(cx: Ctx, value: &JsonValue) -> Option<usize> {
+    let ceiling = crate::dom::shared(cx).limits.incoming_bytes()?;
+    (nsh_core::host_channel::json_size(value, ceiling) > ceiling).then_some(ceiling)
+}
+
 /// The embedding app's event `name`: to its listeners, or kept until one
-/// is added.
+/// is added. One too large for the VM is dropped.
 pub(crate) fn deliver(cx: Ctx, name: &str, data: JsonValue) {
+    if let Some(ceiling) = too_large(cx, &data) {
+        log::warn!(
+            target: "js",
+            "nsh/host: the embedding app's event \"{name}\" is over the {} MB one event may bring into this app; it was dropped",
+            ceiling >> 20
+        );
+        return;
+    }
     if listens(cx, name) {
         dispatch(cx, name, &data);
         return;
@@ -481,6 +496,14 @@ fn finish(cx: Ctx, id: u64, result: Result<JsonValue, JsError>) {
     let deferred = call.deferred;
     match result {
         Ok(value) => {
+            if let Some(ceiling) = too_large(cx, &value) {
+                let e = error(
+                    cx,
+                    nsh_core::host_channel::answer_too_large(&call.name, ceiling),
+                );
+                deferred.reject(cx, e.raw());
+                return;
+            }
             let value = from_json(cx, &value);
             deferred.resolve(cx, value.raw());
         }
