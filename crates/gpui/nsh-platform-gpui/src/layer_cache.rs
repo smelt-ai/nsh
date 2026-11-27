@@ -386,9 +386,11 @@ fn band_axis(v0: f32, vlen: f32, c0: f32, clen: f32) -> Option<(f32, f32)> {
         return Some((v0, vlen));
     }
     let rel0 = (vis0 - v0).max(0.0);
-    let rel1 = (vis1 - v0).min(vlen);
     let b0 = ((rel0 / OVERSIZED_BAND_STEP).floor() * OVERSIZED_BAND_STEP).max(0.0);
-    let b1 = ((rel1 / OVERSIZED_BAND_STEP).ceil() * OVERSIZED_BAND_STEP).min(vlen);
+    // Fixed-height band anchored at `b0`: guarantees `[b0, b1]` covers `[rel0, rel1]`
+    // while only transitioning once per `OVERSIZED_BAND_STEP` (when `b0` steps),
+    // never a second time when `rel1` crosses a grid line.
+    let b1 = (b0 + clen.ceil() + OVERSIZED_BAND_STEP).min(vlen);
     if !b0.is_finite() || !b1.is_finite() || b1 <= b0 {
         return None;
     }
@@ -1032,11 +1034,22 @@ mod tests {
         let b3 = choose_layer_bounds(crate::render::bounds(860.0, -540.0, 120.0, 16_000.0), clip)
             .expect("visible");
 
-        // X axis stays unclipped; Y axis stays quantized to [512, 1536] in content space.
+        // X axis stays unclipped; Y axis stays quantized to a fixed-height band
+        // anchored at b0 = 512 (height = clen.ceil() + 512 = 1237) across the full 512pt step.
         assert_eq!(f32::from(b1.size.width), 120.0);
-        assert_eq!(f32::from(b1.size.height), 1024.0);
+        assert_eq!(f32::from(b1.size.height), 725.0 + OVERSIZED_BAND_STEP);
         assert_eq!(b1.size, b2.size);
         assert_eq!(b2.size, b3.size);
+
+        // Even when rel1 crosses 1536 (at ty = -750, rel0 = 825 still in [512, 1024)),
+        // the fixed-height band stays on the exact same b0 = 512 with zero extra transition.
+        let b4 = choose_layer_bounds(crate::render::bounds(860.0, -750.0, 120.0, 16_000.0), clip)
+            .expect("visible");
+        assert_eq!(b1.size, b4.size);
+        assert_eq!(
+            device_offset(2.0, -500.0, b1.origin.y),
+            device_offset(2.0, -750.0, b4.origin.y),
+        );
 
         // Layer origin translates 1:1 with content, keeping device_offset invariant (cache hit).
         assert_eq!(f32::from(b1.origin.y) - f32::from(b2.origin.y), 20.0);
